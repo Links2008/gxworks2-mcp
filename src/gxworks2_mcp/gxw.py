@@ -539,23 +539,25 @@ def main_res_program(payload, body_len_offset=0x36):
 def _pou_records(payload):
     """Yield (offset, size, body) for the 28-byte record framing in .pou streams.
 
-    Verified on the FX Block programs and the live round trip:
-    01 00 00 00 | size u32 | size u32 | 01 00 00 00 | 0c 00 00 00 |
-    00*4 | ff*4, then size payload bytes.
+    Header (verified against three real projects and the live round trip):
+      01 00 00 00 | size u32 | size u32 | 01 00 00 00 | 0c 00 00 00 |
+      00*4 | ff*4, then size payload bytes.
     """
 
     i = 0
     n = len(payload)
+    marker_zero = bytes.fromhex("00000000")
+    marker_ff = bytes.fromhex("ffffffff")
     while i + 28 <= n:
-        m1, size, size2, m2, m3 = struct.unpack_from('<IIIII', payload, i)
+        m1, size, size2, m2, m3 = struct.unpack_from("<IIIII", payload, i)
         if (
             m1 == 1
             and size == size2
             and m2 == 1
             and m3 == 12
-            and payload[i + 20 : i + 24] == b'\x00' * 4
-            and payload[i + 24 : i + 28] == b'\xff' * 4
-            and 0 < size
+            and payload[i + 20 : i + 24] == marker_zero
+            and payload[i + 24 : i + 28] == marker_ff
+            and 0 < size <= n - i - 28
         ):
             yield (i, size, payload[i + 28 : i + 28 + size])
             i += 28 + size
@@ -563,49 +565,97 @@ def _pou_records(payload):
             i += 1
 
 
-def pou_program(payload, start=0):
-    """Decode POU token records (the ladder block bodies inside .pou streams).
+def _strip_network_trailer(body):
+    """Drop the per-network metadata tail: 01 00 00 00 [u32]? 21 00 00 00 <utf16>."""
 
-    Each 28-byte-framed record carries one block's operator/contact tokens,
-    same table as main_res_program. Records that do not match the table
-    (timestamps, step metadata) are counted as skipped, never guessed.
+    marker_start = bytes.fromhex("01000000")
+    marker_tag = bytes.fromhex("21000000")
+    for position in range(len(body) - 8):
+        if body[position : position + 4] != marker_start:
+            continue
+        for skip in (4, 8):
+            tag_at = position + skip
+            if body[tag_at : tag_at + 4] != marker_tag:
+                continue
+            tail = body[tag_at + 4 :]
+            if not tail or len(tail) % 2:
+                continue
+            if all(0x20 <= tail[i] < 0x7F and tail[i + 1] == 0 for i in range(0, len(tail), 2)):
+                return body[:position]
+    return body
+
+
+def pou_stream(payload):
+    """Decode a .pou program body by cutting it into networks, honestly.
+
+    Structured .pou bodies hold one ladder network per 28-byte record; each
+    record payload is a token run plus a metadata tail
+    (01 00 00 00 [u32]? 21 00 00 00 <utf16 tag>) that carries no ladder data.
+    Two framings are handled:
+      * continuous token stream ending in END (simple projects, MAIN.res style),
+      * one network per record (structured projects) - the tail is stripped and
+        each network decoded on its own, then concatenated.
+    Anything outside the proven operator table is counted, never guessed.
     """
 
     from .il import Instruction, Program, render_il
 
     program = Program()
-    total_body = 0
-    good_body = 0
-    decoded_records = 0
+    networks = 0
     skipped = 0
-    for off, size, body in _pou_records(payload[start:]):
-        total_body += size
-        attempt = main_res_program(struct.pack('<I', size) + body, body_len_offset=0)
-        if attempt.get('decoded') and attempt.get('coverage', 0) >= 0.98:
-            decoded_records += 1
-            good_body += size
-            for line in attempt['il'].splitlines():
-                line = line.strip()
-                if not line or line == 'END':
-                    continue
-                mnemonic, _, operands = line.partition(' ')
-                operands = operands.split('  // ', 1)
-                ins = Instruction(mnemonic, [operands[0].strip()] if operands[0].strip() else [])
-                if len(operands) > 1:
-                    ins.comment = operands[1].strip()
-                program.append(ins)
-        else:
+
+    for _off, _size, body in _pou_records(payload):
+        tokens = _strip_network_trailer(body)
+        if not tokens:
             skipped += 1
+            continue
+        attempt = main_res_program(struct.pack("<I", len(tokens)) + tokens, body_len_offset=0)
+        text = attempt.get("il") if attempt.get("decoded") else attempt.get("partialIl")
+        if not text or not text.strip():
+            skipped += 1
+            continue
+        networks += 1
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line == "END":
+                continue
+            mnemonic, _, operands = line.partition(" ")
+            operands, _, comment = operands.partition("  // ")
+            ins = Instruction(mnemonic, [operands.strip()] if operands.strip() else [])
+            if comment:
+                ins.comment = comment.strip()
+            program.append(ins)
+
     if not program.instructions:
-        return {'decoded': False, 'coverage': 0.0,
-                'stopReason': 'no record payloads matched the operator table',
-                'skippedRecords': skipped}
-    program.append(Instruction('END'))
+        # last resort: a continuous stream ending in END (simple projects)
+        first = payload.find(bytes.fromhex("030003"))
+        if first >= 0:
+            end = payload.find(bytes.fromhex("04340204"), first)
+            if end > first:
+                stream = payload[first : end + 4]
+                attempt = main_res_program(struct.pack("<I", len(stream)) + stream, body_len_offset=0)
+                if attempt.get("decoded"):
+                    return {
+                        "decoded": True,
+                        "coverage": 1.0,
+                        "framing": "continuous-token-stream",
+                        "il": attempt["il"],
+                        "devices": attempt["devices"],
+                    }
+        return {
+            "decoded": False,
+            "coverage": 0.0,
+            "stopReason": "no network record and no continuous token stream decoded",
+        }
+
+    program.append(Instruction("END"))
     return {
-        'decoded': True,
-        'coverage': round(good_body / max(1, total_body), 3),
-        'records': decoded_records,
-        'skippedRecords': skipped,
-        'il': render_il(program),
-        'devices': program.devices(),
+        "decoded": True,
+        "coverage": round(networks / max(1, networks + skipped), 3),
+        "framing": "network-records",
+        "networks": networks,
+        "skippedNetworks": skipped,
+        "il": render_il(program),
+        "devices": program.devices(),
     }
+

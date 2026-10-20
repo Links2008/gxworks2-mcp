@@ -245,3 +245,55 @@ def test_trace_reports_boundary_without_writer():
 def test_interlock_summary_finds_multi_writer():
     summary = interlock_summary(BELT)
     assert summary["multiWriterCoils"].get("Y1") == 2
+
+
+# --- .pou (structured project) decoding ---------------------------------------
+
+from gxworks2_mcp.gxw import pou_stream  # noqa: E402
+
+
+def _pou_record(tokens: bytes, tag: bytes = b'deadbeef') -> bytes:
+    header = (
+        bytes.fromhex('01000000')
+        + struct.pack('<I', len(tokens))
+        + struct.pack('<I', len(tokens))
+        + bytes.fromhex('01000000')
+        + bytes.fromhex('0c000000')
+        + bytes.fromhex('00000000')
+        + bytes.fromhex('ffffffff')
+    )
+    trailer = bytes.fromhex('01000000') + bytes.fromhex('21000000') + tag.decode().encode('utf-16-le')
+    return header + tokens + trailer
+
+
+def test_pou_decodes_one_network_record():
+    tokens = (
+        bytes.fromhex('030003') + bytes.fromhex('049c0004')
+        + bytes.fromhex('032003') + bytes.fromhex('049d0004')
+    )
+    out = pou_stream(_pou_record(tokens))
+    assert out['decoded'] is True
+    assert out['networks'] == 1
+    lines = out['il'].splitlines()
+    assert 'LD X0' in lines and 'OUT Y0' in lines
+
+
+def test_pou_skips_metadata_only_record():
+    empty = bytes.fromhex('01000000') + bytes.fromhex('21000000') + 'ab'.encode('utf-16-le')
+    out = pou_stream(_pou_record(b'') + empty)
+    assert out['decoded'] is False
+    assert 'stopReason' in out
+
+
+@pytest.mark.skipif(not have_gt, reason='ground-truth project not present')
+def test_pou_decodes_the_live_round_trip_project():
+    project = open_gxw(GROUND_TRUTH)
+    try:
+        body = project.read_stream(project.find('MAIN.Program.pou'))
+    finally:
+        project.close()
+    out = pou_stream(body)
+    assert out['decoded'] is True
+    il = out['il']
+    for line in ('LD X0', 'OUT Y0  // motor', 'LDP X2', 'OUT Y2  // flag', 'END'):
+        assert line in il

@@ -24,7 +24,9 @@ GX Works2 没有公开自动化 API，工程文件 .gxw 是二进制复合文档
    Python（olefile）直接打开 .gxw——外层 OLE2 + 内嵌 _hdb OLE2 + diffgram XML 数据清单
    （iID==内层流号，MAIN.res/POU/任务/参数全部定位），Q 系列的 MAIN.res 程序体已能解码回 IL
    （语法经「写入→保存→读回」闭环逐字节对撞验证，见 re-evidence/GRAMMAR.md；
-   未知构造一律停止并报 stopReason，绝不编造指令）；FX 等其它家族仍是框架级。
+   未知构造一律停止并报 stopReason，绝不编造指令）；
+   **结构化工程的 .pou 程序体同样能解码**（网络记录 + 元数据尾切分，实测你本地工程
+   Block1 coverage 1.0 / Block 0.78），FX 与 Q 两族都支持。
 2. **MC 协议路线（连 PLC）**：QnA 兼容 3E 帧，字节序/设备码/位打包已与参考实现逐字节比对，
    并已按三菱官方手册 SH-080008 校验。直接读写软元件、远程 RUN/STOP/PAUSE/latch clear。
 

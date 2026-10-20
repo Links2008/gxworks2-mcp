@@ -41,7 +41,14 @@ from typing import Any
 from .analysis import AnalysisError, interlock_summary, trace_device, where_used
 from .author import BuildError, compile_rungs
 from .csvio import CSVFormatError, read_program_csv, write_program_csv
-from .gxw import GxwError, device_comments, main_res_program, open_gxw, pou_anchors
+from .gxw import (
+    GxwError,
+    device_comments,
+    main_res_program,
+    open_gxw,
+    pou_anchors,
+    pou_stream,
+)
 from .blocks import ladder_blocks, render_ascii, to_boolean
 from .devices import DeviceError, describe as describe_device, expand_range, parse_range
 from .il import ILParseError, Program, instruction_count, parse_il, render_il
@@ -393,9 +400,13 @@ def gx_gxw_inventory(path: str) -> str:
     payload = project.summary()
     structure = project.program_structure()
     for entry in structure:
-        if entry.get("name", "").endswith(".res") and entry.get("available"):
+        if entry.get("available") and entry.get("name", "").lower().endswith((".res", ".pou")):
+            body = project.read_stream(project.find(entry["name"]))
             try:
-                decoded = main_res_program(project.read_stream(project.find(entry["name"])))
+                if entry["name"].lower().endswith(".pou"):
+                    decoded = pou_stream(body)
+                else:
+                    decoded = main_res_program(body)
             except GxwError as exc:
                 decoded = {"decoded": False, "error": str(exc)}
             entry["decode"] = {
