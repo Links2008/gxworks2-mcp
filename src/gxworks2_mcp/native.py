@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import struct
 import tempfile
 import time
@@ -64,18 +63,21 @@ def encode_program(program: Program, cpu: str = "FX3U", text_encoding: str = "ut
     return bytes(output)
 
 
-def _replace_cfb(path: Path, replacements: dict[str, bytes]) -> None:
-    """使用 Windows IStorage 修改私有临时副本，支持流增长和缩小。"""
+def _replace_cfb(data: bytes, replacements: dict[str, bytes]) -> bytes:
+    """在内存中使用 Windows IStorage 封装，支持流增长和缩小。"""
     try:
         import pythoncom
         from win32com import storagecon
     except ImportError as exc:
         raise GxwError("Windows 原生封装需要 pywin32：pip install 'gxworks2-mcp[native]'") from exc
     pythoncom.CoInitialize()
-    storage = stream = None
+    storage = stream = memory = None
     try:
         mode = storagecon.STGM_READWRITE | storagecon.STGM_SHARE_EXCLUSIVE
-        storage = pythoncom.StgOpenStorage(str(path), None, mode)
+        memory = pythoncom.CreateILockBytesOnHGlobal()
+        if memory.WriteAt(0, data) != len(data):
+            raise GxwError("复合文档未完整载入内存")
+        storage = pythoncom.StgOpenStorageOnILockBytes(memory, None, mode)
         for name, payload in replacements.items():
             stream = storage.OpenStream(name, None, mode)
             stream.SetSize(len(payload))
@@ -86,10 +88,16 @@ def _replace_cfb(path: Path, replacements: dict[str, bytes]) -> None:
             stream.Commit(0)
             stream = None
         storage.Commit(0)
+        storage = None
+        size = memory.Stat(1)[2]
+        result = memory.ReadAt(0, size)
+        if len(result) != size:
+            raise GxwError("复合文档未完整读回")
+        return result
     except pythoncom.com_error as exc:
         raise GxwError("Windows 复合文档写入失败：" + str(exc)) from exc
     finally:
-        stream = storage = None
+        stream = storage = memory = None
         pythoncom.CoUninitialize()
 
 
@@ -147,6 +155,7 @@ def write_gxw(template: str, output: str, program: Program, *, cpu: str = "FX3U"
         before_inner = {"/".join(n): project._inner.openstream(n).read() for n in project._inner.listdir()}
         history = _history(before_outer["history.xml"], {entry.stream_id: (original, replacement)})
         stream_id, block_name = entry.stream_id, entry.name
+        source_bytes = project._raw
     finally:
         project.close()
     from .il import parse_il
@@ -154,16 +163,15 @@ def write_gxw(template: str, output: str, program: Program, *, cpu: str = "FX3U"
     if not readback.get("decoded") or [str(i) for i in parse_il(readback["il"]).instructions] != [str(i) for i in program.instructions]:
         raise GxwError("二进制源码读回与待写程序不一致")
     with tempfile.TemporaryDirectory(prefix="gxw-write-", dir=target.parent) as scratch:
-        outer_path, inner_path = Path(scratch) / "candidate.gxw", Path(scratch) / "inner.cfb"
-        shutil.copy2(source, outer_path)
-        inner_path.write_bytes(before_outer["_hdb"])
-        _replace_cfb(inner_path, {stream_id: replacement})
-        _replace_cfb(outer_path, {"_hdb": inner_path.read_bytes(), "history.xml": history})
+        outer_path = Path(scratch) / "candidate.gxw"
+        inner_bytes = _replace_cfb(before_outer["_hdb"], {stream_id: replacement})
+        candidate = _replace_cfb(source_bytes, {"_hdb": inner_bytes, "history.xml": history})
+        outer_path.write_bytes(candidate)
         check = open_gxw(outer_path)
         try:
             after_inner = {"/".join(n): check._inner.openstream(n).read() for n in check._inner.listdir()}
             after_outer = {"/".join(n): check._outer.openstream(n).read() for n in check._outer.listdir()}
-            if after_inner != {**before_inner, stream_id: replacement} or after_outer != {**before_outer, "_hdb": inner_path.read_bytes(), "history.xml": history}:
+            if after_inner != {**before_inner, stream_id: replacement} or after_outer != {**before_outer, "_hdb": inner_bytes, "history.xml": history}:
                 raise GxwError("原生封装改变了非目标数据流，已拒绝交付")
         finally:
             check.close()

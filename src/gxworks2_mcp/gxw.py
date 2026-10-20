@@ -105,6 +105,7 @@ class GxwProject:
     coverage: dict[str, int] = field(default_factory=dict)
     _outer: Any = None
     _inner: Any = None
+    _raw: bytes = field(default=b"", repr=False)
 
     def find(self, suffix: str) -> DataFile | None:
         want = suffix.lower()
@@ -200,7 +201,7 @@ def open_gxw(path: str | Path) -> GxwProject:
     if raw[:8] != b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
         raise GxwError(str(target) + " is not an OLE2 compound file; not a .gxw?")
 
-    project = GxwProject(path=str(target))
+    project = GxwProject(path=str(target), _raw=raw)
     outer = olefile.OleFileIO(io.BytesIO(raw))
     project._outer = outer
     try:

@@ -88,3 +88,51 @@ def test_native_sfc_child_networks_are_not_a_complete_program():
     result = pou_stream(source, cpu="FX3U")
     assert not result["decoded"]
     assert "SFC" in result["stopReason"] and "LD X0" in result["partialIl"]
+
+
+def test_memory_storage_grows_and_shrinks_without_touching_other_streams():
+    import io
+    import olefile
+    from gxworks2_mcp.native import _replace_cfb
+    original = TEMPLATE.read_bytes()
+    with olefile.OleFileIO(io.BytesIO(original)) as document:
+        expected = {"/".join(n): document.openstream(n).read() for n in document.listdir()}
+    for payload in (b"x" * 18000, b"small"):
+        updated = _replace_cfb(original, {"history.xml": payload})
+        with olefile.OleFileIO(io.BytesIO(updated)) as document:
+            actual = {"/".join(n): document.openstream(n).read() for n in document.listdir()}
+        assert actual == {**expected, "history.xml": payload}
+        original = updated
+        expected = actual
+
+
+def test_disk_corruption_is_rejected_and_temporary_files_are_cleaned(tmp_path, monkeypatch):
+    original_write = Path.write_bytes
+    def corrupt_candidate(path, payload):
+        if path.name == "candidate.gxw":
+            payload = b"invalid container"
+        return original_write(path, payload)
+    monkeypatch.setattr(Path, "write_bytes", corrupt_candidate)
+    with pytest.raises(GxwError):
+        write_gxw(str(TEMPLATE), str(tmp_path / "rejected.gxw"), parse_il("LD X0\nOUT Y0\nEND"))
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_large_source_crosses_sector_boundary_then_shrinks(tmp_path):
+    large = parse_il("\n".join(f"LD X0\nOUT M{i}" for i in range(700)) + "\nEND")
+    path = tmp_path / "large.gxw"
+    assert write_gxw(str(TEMPLATE), str(path), large)["sourceReadback"]
+    assert write_gxw(str(path), str(tmp_path / "small.gxw"), parse_il("END"))["otherStreamsPreserved"]
+
+
+def test_valid_container_with_unrelated_stream_change_is_rejected(tmp_path, monkeypatch):
+    from gxworks2_mcp import native
+    replace = native._replace_cfb
+    def alter(data, replacements):
+        if "_hdb" in replacements:
+            replacements = {**replacements, "Project.gd2": b"unrelated change"}
+        return replace(data, replacements)
+    monkeypatch.setattr(native, "_replace_cfb", alter)
+    with pytest.raises(GxwError, match="非目标"):
+        write_gxw(str(TEMPLATE), str(tmp_path / "rejected.gxw"), parse_il("END"))
+    assert list(tmp_path.iterdir()) == []
