@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gxworks2-mcp"
+version = "0.1.0"
+description = "MCP server for Mitsubishi GX Works2 / MELSEC PLC programming: IL/ladder authoring, program analysis, MC protocol I/O, and optional GX Works2 UI automation."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Linkshub" }]
+keywords = ["mcp", "gx-works2", "melsec", "plc", "ladder", "mcprotocol", "mitsubishi"]
+dependencies = ["mcp>=1.2.0", "olefile>=0.46"]
+
+[project.optional-dependencies]
+ui = ["pywinauto>=0.6.8", "pywin32>=306"]
+dev = ["pytest>=8.0", "pyyaml>=6.0"]
+
+[project.scripts]
+gxworks2-mcp = "gxworks2_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+gxworks2_mcp = ["data/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
