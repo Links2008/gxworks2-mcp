@@ -138,6 +138,7 @@ def build_rungs(program: Program) -> list[Rung]:
 
     state = _State()
     rungs: list[Rung] = []
+    active_step: Node | None = None
 
     def take_contact() -> Node:
         node: Node = contact_for(instruction)
@@ -149,7 +150,7 @@ def build_rungs(program: Program) -> list[Rung]:
     def close() -> None:
         rungs.append(
             Rung(
-                logic=state.block,
+                logic=intersect(active_step, state.block) if state.block is not None else active_step,
                 instruction=instruction,
                 steps=(state.start, state.step - 1),
             )
@@ -165,7 +166,13 @@ def build_rungs(program: Program) -> list[Rung]:
     for instruction in program.instructions:
         mnemonic = instruction.mnemonic
         state.step += 1
-        if mnemonic in CONTACT_START:
+        if mnemonic == "STL":
+            active_step = Contact(device=instruction.operands[0])
+            state.block = state.saved = None
+        elif mnemonic == "RET":
+            active_step = None
+            close()
+        elif mnemonic in CONTACT_START:
             if state.block is not None and state.saved is None:
                 state.saved = state.block
             state.block = take_contact()

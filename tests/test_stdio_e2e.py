@@ -6,6 +6,8 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
+from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -13,6 +15,8 @@ from mcp.client.stdio import stdio_client
 
 async def main() -> int:
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, root)
+    temporary = tempfile.TemporaryDirectory(prefix="gxworks2-stdio-")
     params = StdioServerParameters(
         command=sys.executable,
         args=["-m", "gxworks2_mcp"],
@@ -20,7 +24,7 @@ async def main() -> int:
             **os.environ,
             "PYTHONPATH": os.path.join(root, "src"),
             "PYTHONIOENCODING": "utf-8",
-            "GXWORKS2_MCP_HOME": os.path.join(root, ".mcp-cache"),
+            "GXWORKS2_MCP_HOME": temporary.name,
         },
         cwd=root,
     )
@@ -31,21 +35,36 @@ async def main() -> int:
             print("server:", info.name, info.version)
             tools = await session.list_tools()
             print("tools:", len(tools.tools))
-            for tool in tools.tools:
-                first = (tool.description or "").strip().splitlines()[0]
-                print(" -", tool.name, "::", first[:80])
+            assert "gx_write_project" in {tool.name for tool in tools.tools}
             result = await session.call_tool(
                 "gx_program_create",
                 {
                     "name": "stdio-demo",
-                    "cpu": "Q",
-                    "rungs": [{"out": "Y0", "logic": {"and": ["X0", {"not": "X1"}]}, "comment": "lamp"}],
+                    "cpu": "FX3U",
+                    "rungs": [{"out": "Y0", "logic": {"and": ["X10", {"not": "X1"}]}, "comment": "lamp"}],
                 },
             )
             text = result.content[0].text if result.content else ""
-            print("create ok:", "LD X0" in text and "OUT Y0" in text)
+            assert "LD X10" in text and "OUT Y0" in text
             ascii_result = await session.call_tool("gx_program_export", {"name": "stdio-demo", "format": "ascii"})
             print("ascii:", ascii_result.content[0].text.strip())
+            written = await session.call_tool("gx_write_project", {
+                "name": "stdio-demo", "path": str(Path(temporary.name) / "ladder.gxw"), "confirm": True,
+            })
+            report = json.loads(written.content[0].text)
+            assert report.get("ok") and report["computerUseCalls"] == 0, report
+            opened = await session.call_tool("gx_gxw_open", {"path": report["path"]})
+            assert "LD X10" in opened.content[0].text
+            from examples.fx3u_sequence import sequence_spec
+            result = await session.call_tool("gx_program_create", {"name": "sfc-demo", "cpu": "FX3U", "sfc": sequence_spec()})
+            assert "STL S0" in result.content[0].text
+            written_sfc = await session.call_tool("gx_write_project", {
+                "name": "sfc-demo", "path": str(Path(temporary.name) / "sfc.gxw"), "confirm": True,
+            })
+            sfc_report = json.loads(written_sfc.content[0].text)
+            assert sfc_report.get("ok") and sfc_report["sourceReadback"], sfc_report
+            print(json.dumps({"ladderWriteMs": report["writeMs"], "sfcWriteMs": sfc_report["writeMs"], "stdioVerified": True}))
+    temporary.cleanup()
     return 0
 
 

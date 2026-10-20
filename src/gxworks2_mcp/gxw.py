@@ -28,11 +28,13 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import re
 import struct
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
+from functools import lru_cache
 from typing import Any
 
 try:
@@ -95,6 +97,8 @@ class GxwProject:
 
     path: str
     name: str = ""
+    cpu: str = ""
+    text_encoding: str = "utf-8"
     created: str = ""
     data_files: list[DataFile] = field(default_factory=list)
     diagnostics: list[str] = field(default_factory=list)
@@ -158,6 +162,8 @@ class GxwProject:
         return {
             "path": self.path,
             "projectName": self.name,
+            "cpu": self.cpu,
+            "textEncoding": self.text_encoding,
             "created": self.created,
             "dataFiles": len(self.data_files),
             "byKind": dict(sorted(kinds.items())),
@@ -251,6 +257,23 @@ def open_gxw(path: str | Path) -> GxwProject:
             project.data_files.append(entry)
     except Exception as exc:
         project.diagnostics.append("projectdatalist.xml: " + str(exc))
+
+    for entry in project.data_files:
+        if entry.name.endswith(".prj") and entry.stream_id:
+            try:
+                raw_prj = project.read_stream(entry)
+                cursor, texts = 0, []
+                for _ in range(3):
+                    count = struct.unpack_from("<I", raw_prj, cursor)[0]
+                    if not 1 <= count <= 8192 or cursor + 4 + count * 2 > len(raw_prj):
+                        raise ValueError("CPU 元数据字符串越界")
+                    texts.append(raw_prj[cursor + 4:cursor + 4 + count * 2].decode("utf-16le").rstrip("\0"))
+                    cursor += 4 + count * 2
+                project.cpu = texts[1]
+                codepage = struct.unpack_from("<I", raw_prj, cursor + 42)[0]
+                project.text_encoding = {932: "cp932", 936: "gb18030", 949: "cp949", 1252: "cp1252"}.get(codepage, "")
+            except (ValueError, struct.error) as exc:
+                project.diagnostics.append("CPU metadata: " + str(exc))
 
     # 3) coverage bookkeeping: how much of the container is explained
     known = {"Project.gd2", "_hdb", "projectlist.xml", "projectdatalist.xml", "checkout.xml",
@@ -438,35 +461,51 @@ _CONTACT_CODES = {
 }
 
 
-def _fmt(name, radix, value):
+@lru_cache(maxsize=1)
+def _fx_operators():
+    """采用有原生样例依据的 FX3U 表；来源及许可见 third-party。"""
+    catalog = json.loads((Path(__file__).with_name("data") / "fx3u_step_widths.json").read_text(encoding="utf-8"))
+    operators = {bytes.fromhex(k): tuple(v) for k, v in {**catalog["opcodes"], **catalog["supplemental_encodings"]}.items()}
+    operators[bytes.fromhex("04210304")] = ("OUT", 2)
+    return operators
+
+
+def _fmt(name, radix, value, cpu=""):
+    if cpu.upper().startswith("FX"):
+        if name in ("X", "Y"):
+            return name + format(value, "o")
+        name = {"TN": "T", "CN": "C"}.get(name, name)
     return name + (format(value, 'X') if radix == 16 else str(value))
 
 
-def _read_operator(stream, i):
-    for seq, (name, arity) in _OPERATORS.items():
+def _read_operator(stream, i, cpu=""):
+    operators = _fx_operators() if cpu.upper().startswith("FX3U") else _OPERATORS
+    for seq, (name, arity) in operators.items():
         if stream[i : i + len(seq)] == seq:
             return (name, arity, i + len(seq))
     return None
 
 
-def _read_operand(stream, i):
+def _read_operand(stream, i, cpu=""):
     if i + 4 <= len(stream) and stream[i] == 0x04 and stream[i + 3] == 0x04:
         named = _CONTACT_CODES.get(stream[i + 1])
         if named:
-            return (_fmt(named[0], named[1], stream[i + 2]), i + 4)
+            return (_fmt(named[0], named[1], stream[i + 2], cpu), i + 4)
         if stream[i + 1] == 0xE8:
             return ('K' + str(stream[i + 2]), i + 4)
     if i + 5 <= len(stream) and stream[i] == 0x05 and stream[i + 4] == 0x05:
         named = _CONTACT_CODES.get(stream[i + 1])
         if named:
             value = int.from_bytes(stream[i + 2 : i + 4], 'little')
-            return (_fmt(named[0], named[1], value), i + 5)
+            return (_fmt(named[0], named[1], value, cpu), i + 5)
+        if stream[i + 1] == 0xE8:
+            return ('K' + str(int.from_bytes(stream[i + 2:i + 4], 'little', signed=True)), i + 5)
         if stream[i + 1] == 0xEA:
             return ('H' + format(int.from_bytes(stream[i + 2 : i + 4], 'little'), '04X'), i + 5)
     return None
 
 
-def main_res_program(payload, body_len_offset=0x36):
+def main_res_program(payload, body_len_offset=0x36, cpu="", text_encoding="utf-8"):
     """Decode a MAIN.res body to IL using the proven operator table.
 
     Walks operator records then operands. A coil comment record is
@@ -490,13 +529,13 @@ def main_res_program(payload, body_len_offset=0x36):
     i = 0
     stop = ''
     while i < len(stream):
-        operator = _read_operator(stream, i)
+        operator = _read_operator(stream, i, cpu)
         if operator is not None:
             name, arity, i = operator
             operands = []
             bad = ''
             for _ in range(arity):
-                got = _read_operand(stream, i)
+                got = _read_operand(stream, i, cpu)
                 if got is None:
                     bad = name + ' operand unreadable at ' + hex(i)
                     break
@@ -513,9 +552,10 @@ def main_res_program(payload, body_len_offset=0x36):
             if 1 <= length <= 60 and stream[i] == length + 4 and tail == bytes([stream[i]]):
                 raw = stream[i + 3 : i + 3 + length]
                 try:
-                    text = raw.decode('utf-8')
+                    text = raw.decode(text_encoding or "utf-8")
                 except UnicodeDecodeError:
-                    text = raw.decode('latin1', errors='replace')
+                    stop = "comment cannot be decoded with the project code page"
+                    break
                 if program.instructions and program.instructions[-1].is_output:
                     program.instructions[-1].comment = text
                 i += 4 + length
@@ -585,7 +625,7 @@ def _strip_network_trailer(body):
     return body
 
 
-def pou_stream(payload):
+def pou_stream(payload, cpu="", text_encoding="utf-8"):
     """Decode a .pou program body by cutting it into networks, honestly.
 
     Structured .pou bodies hold one ladder network per 28-byte record; each
@@ -600,16 +640,38 @@ def pou_stream(payload):
 
     from .il import Instruction, Program, render_il
 
+    native_sfc = len(payload) >= 58 and struct.unpack_from("<I", payload, 54)[0] == 240
+    if len(payload) >= 103 and payload[54] == 1:
+        sizes = struct.unpack_from("<II", payload, 55)
+        if sizes == (len(payload) - 83,) * 2 and payload[63:79] in (
+            bytes.fromhex("010000000c00000000000000ffffffff"),
+            bytes.fromhex("000000000c00000000000000ffffffff"),
+        ):
+            tokens = payload[79:-24]
+            result = main_res_program(struct.pack("<I", len(tokens)) + tokens, body_len_offset=0, cpu=cpu, text_encoding=text_encoding)
+            result["framing"] = "simple-token-frame"
+            return result
+
     program = Program()
     networks = 0
     skipped = 0
+    incomplete = []
+    token_bytes = 0
+    consumed_bytes = 0
 
     for _off, _size, body in _pou_records(payload):
         tokens = _strip_network_trailer(body)
         if not tokens:
             skipped += 1
             continue
-        attempt = main_res_program(struct.pack("<I", len(tokens)) + tokens, body_len_offset=0)
+        attempt = main_res_program(struct.pack("<I", len(tokens)) + tokens, body_len_offset=0, cpu=cpu, text_encoding=text_encoding)
+        token_bytes += len(tokens)
+        consumed_bytes += attempt.get("consumedBytes", 0)
+        if not attempt.get("decoded") and not (
+            attempt.get("stopReason") == "stream ended without END/FEND"
+            and attempt.get("consumedBytes") == len(tokens)
+        ):
+            incomplete.append({"offset": _off, "reason": attempt.get("stopReason", attempt.get("error", "未知记录"))})
         text = attempt.get("il") if attempt.get("decoded") else attempt.get("partialIl")
         if not text or not text.strip():
             skipped += 1
@@ -621,7 +683,7 @@ def pou_stream(payload):
                 continue
             mnemonic, _, operands = line.partition(" ")
             operands, _, comment = operands.partition("  // ")
-            ins = Instruction(mnemonic, [operands.strip()] if operands.strip() else [])
+            ins = Instruction(mnemonic, operands.split() if operands.strip() else [])
             if comment:
                 ins.comment = comment.strip()
             program.append(ins)
@@ -629,11 +691,11 @@ def pou_stream(payload):
     if not program.instructions:
         # last resort: a continuous stream ending in END (simple projects)
         first = payload.find(bytes.fromhex("030003"))
-        if first >= 0:
+        if first >= 0 and not incomplete and not native_sfc:
             end = payload.find(bytes.fromhex("04340204"), first)
             if end > first:
                 stream = payload[first : end + 4]
-                attempt = main_res_program(struct.pack("<I", len(stream)) + stream, body_len_offset=0)
+                attempt = main_res_program(struct.pack("<I", len(stream)) + stream, body_len_offset=0, cpu=cpu, text_encoding=text_encoding)
                 if attempt.get("decoded"):
                     return {
                         "decoded": True,
@@ -649,9 +711,18 @@ def pou_stream(payload):
         }
 
     program.append(Instruction("END"))
+    if incomplete or native_sfc:
+        return {
+            "decoded": False,
+            "coverage": round(consumed_bytes / max(1, token_bytes), 3),
+            "framing": "network-records",
+            "partialIl": render_il(program),
+            "stopReason": "原生 SFC 图形及步骤绑定尚未完整解码，仅返回子网络指令" if native_sfc else "存在未完整解码的网络，禁止作为完整程序写回",
+            "incompleteNetworks": incomplete,
+        }
     return {
         "decoded": True,
-        "coverage": round(networks / max(1, networks + skipped), 3),
+        "coverage": 1.0,
         "framing": "network-records",
         "networks": networks,
         "skippedNetworks": skipped,

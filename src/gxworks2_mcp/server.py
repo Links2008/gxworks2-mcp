@@ -54,18 +54,20 @@ from .devices import DeviceError, describe as describe_device, expand_range, par
 from .il import ILParseError, Program, instruction_count, parse_il, render_il
 from .mcprotocol import MCClient, MCConfig, MCProtocolError, probe as mc_probe
 from .store import Store, StoreError, device_usage, diff_programs
+from .sfc import compile_sfc, describe_sfc
 from .compat import SDK_GENERATION, create_server, run_server
 from .validate import summarize, validate_program
 
 DEFAULT_WORKSPACE = Path(os.environ.get("GXWORKS2_MCP_HOME", Path.home() / ".gxworks2-mcp"))
 
 _INSTRUCTIONS = (
-    "Author MELSEC ladder programs for GX Works2. Verified end-to-end flow: "
-    "gx_program_create with rungs -> gx_program_validate -> gx_program_export_csv -> "
-    "gx_import_csv (confirm=true; drives GX Works2's Edit > Read from CSV file through UIA, "
-    "no mouse or foreground focus needed) -> gx_compile_csv -> gx_save_project. "
-    "The CSV import REPLACES the current ladder program. Verify runtime behaviour with "
-    "plc_read. gx_paste_ladder is legacy: pasting IL text does nothing on GX Works2 1.620W."
+    "优先支持 FX3U：gx_program_create(cpu='FX3U', rungs=梯形图或sfc=步骤图) -> "
+    "gx_program_validate -> gx_write_project(confirm=true, path=新文件路径)。"
+    "直接写原生 GXW，不需要 GX Works2、computer use、鼠标、键盘或截图；自动核对源码和其他数据流。"
+    "SFC 以 FX3U STL/RET 步进程序保存，原生 SFC 图形布局另行支持。"
+    "gx_gxw_open 直接读取工程CPU和每个程序体；导入编辑时显式选择 program='MAIN.Program.pou'，"
+    "禁止把部分解码的内容当完整源码覆盖。生成文件仍需在 GX Works2 编译；实体 PLC 另行验证。"
+    "旧 CSV/UIA 工具保留为可选通路；不要自动调用 PLC 写入或远程控制工具。"
 )
 server = create_server("gxworks2", _INSTRUCTIONS)
 _store: Store | None = None
@@ -90,17 +92,28 @@ def gx_program_create(
     il: str = "",
     rungs: list[dict[str, Any]] | None = None,
     overwrite: bool = False,
+    sfc: dict[str, Any] | None = None,
 ) -> str:
     """Create a program project.
 
     Pass either IL text or a list of rungs. A rung looks like:
       {"out": "Y0", "comment": "start", "logic": {"or": [{"and": ["X0", {"not": "X1"}]}, "M10"]}}
+    也可传 sfc={initial:'S0', steps:[{state:'S0', actions:[{out:'Y0'}],
+    transitions:[{to:'S20', when:'X0'}]}, ...]}，cpu 必须显式为 FX3U。
+    定时器回路可用 {out:'T0', preset:'K10', logic:'M0'}。
     The logic tree supports and / or, and operands may be a device string or
     {"not": "X1"}, {"rise": "X2"}, {"fall": "X3"}.
     """
 
     try:
-        if rungs:
+        if sum((bool(rungs), bool(il), sfc is not None)) > 1:
+            raise BuildError("il、rungs、sfc 只能选择一种输入")
+        if sfc is not None:
+            program = compile_sfc(sfc, cpu)
+            validation = summarize(validate_program(program, cpu=cpu))
+            if not validation["ok"]:
+                return json.dumps({"error": "SFC 校验失败", "validation": validation}, ensure_ascii=False)
+        elif rungs:
             program = compile_rungs(rungs)
         elif il:
             program = parse_il(il)
@@ -157,6 +170,27 @@ def gx_program_add_rungs(name: str, rungs: list[dict[str, Any]], replace: bool =
 
 
 @server.tool()
+def gx_write_project(name: str, path: str, template_path: str = "", block: str = "", confirm: bool = False) -> str:
+    """直接写出新的 GXW 原生源码，不启动 GX Works2，不调用 computer use。
+
+    name 是已用 gx_program_create 编写的 FX3U 梯形图或 SFC 工程。
+    path 必须为尚不存在的 .gxw 文件；原始模板始终只读。
+    写入后自动读回源码，并逐一核实所有其他数据流未变。
+    requiresCompile=true 表示仍需在 GX Works2 编译；源码读回不是实体 PLC 验证。
+    """
+    if not confirm:
+        return json.dumps({"ok": False, "error": "请传 confirm=true，写出新的 GXW 文件"}, ensure_ascii=False)
+    from .native import write_gxw
+    try:
+        project = store().get(name)
+        template = template_path or str(Path(__file__).with_name("data") / "fx3u-ladder.gxw")
+        result = write_gxw(template, path, project.read_program(), cpu=project.cpu, block=block)
+    except (GxwError, StoreError, ILParseError, DeviceError, OSError, ValueError) as exc:
+        return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@server.tool()
 def gx_program_replace(name: str, il: str) -> str:
     """Replace a project's program with new IL text (validated before writing)."""
 
@@ -207,6 +241,8 @@ def gx_program_read(name: str, include: str = "il,ascii,logic") -> str:
         payload["logic"] = to_boolean(program)
     if "rungs" in wanted:
         payload["rungs"] = ladder_blocks(program)
+    if "sfc" in wanted or any(ins.mnemonic == "STL" for ins in program.instructions):
+        payload["sfc"] = describe_sfc(program)
     payload["validation"] = summarize(validate_program(program, cpu=project.cpu))
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -404,9 +440,9 @@ def gx_gxw_inventory(path: str) -> str:
             body = project.read_stream(project.find(entry["name"]))
             try:
                 if entry["name"].lower().endswith(".pou"):
-                    decoded = pou_stream(body)
+                    decoded = pou_stream(body, cpu=project.cpu, text_encoding=project.text_encoding)
                 else:
-                    decoded = main_res_program(body)
+                    decoded = main_res_program(body, cpu=project.cpu, text_encoding=project.text_encoding)
             except GxwError as exc:
                 decoded = {"decoded": False, "error": str(exc)}
             entry["decode"] = {
@@ -422,7 +458,7 @@ def gx_gxw_inventory(path: str) -> str:
 
 
 @server.tool()
-def gx_gxw_open(path: str, import_into: str = "", overwrite: bool = False) -> str:
+def gx_gxw_open(path: str, import_into: str = "", overwrite: bool = False, program: str = "", cpu: str = "") -> str:
     """Deep-read a .gxw, optionally materialize it as an editable store project.
 
     Extracts container metadata, label-table comments, per-program anchors and raw
@@ -440,49 +476,41 @@ def gx_gxw_open(path: str, import_into: str = "", overwrite: bool = False) -> st
     summary = project.summary()
     summary["programStructure"] = project.program_structure()
     summary["deviceComments"] = device_comments(project)
-    blobs: dict[str, int] = {}
-    target = import_into or (Path(path).stem + "-gxw")
+    summary["decodedPrograms"] = []
     try:
-        if import_into:
-            if overwrite:
-                try:
-                    store().delete(import_into)
-                except StoreError:
-                    pass
-            store().create(import_into, cpu="", title=project.name)
-        base = store().get(target).root
-        (base / "gxw_manifest.json").write_text(
-            json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
-        decoded_any = False
         for entry in project.programs():
             try:
                 payload = project.read_stream(entry)
-            except GxwError:
+                decoder = pou_stream if entry.name.lower().endswith(".pou") else main_res_program
+                attempt = decoder(payload, cpu=project.cpu, text_encoding=project.text_encoding)
+            except GxwError as exc:
+                summary["decodedPrograms"].append({"name": entry.name, "decoded": False, "error": str(exc)})
                 continue
-            (base / ("program_" + _safe_name(entry.name) + ".raw.bin")).write_bytes(payload)
-            blobs[entry.name] = len(payload)
-            if entry.name.endswith(".res"):
-                attempt = main_res_program(payload)
-                summary["decode"] = {k: attempt[k] for k in ("decoded", "coverage", "il", "stopReason") if k in attempt}
-                if attempt.get("decoded"):
-                    from .il import parse_il, render_il as _render
-
-                    store_project = store().get(target)
-                    store_project.save(parse_il(attempt["il"], title=project.name))
-                    decoded_any = True
-                    summary["programBodiesDecoded"] = 1
-        if decoded_any:
-            summary["editable"] = True
-            summary["editableNote"] = "program.il holds the decoded IL: edit with gx_program_add_rungs / "
-            summary["editableNote"] += "gx_program_replace, then push back with gx_import_csv"
-        else:
-            summary["editable"] = False
-        summary["storeProject"] = target
-        summary["rawBodies"] = blobs
-    except (StoreError, OSError) as exc:
+            summary["decodedPrograms"].append({"name": entry.name, "id": entry.iid, **attempt})
+        complete = [p for p in summary["decodedPrograms"] if p.get("decoded") and p.get("coverage") == 1.0]
+        summary["programBodiesDecoded"] = len(complete)
+        summary["editable"] = bool(complete)
+        if import_into:
+            selected = [p for p in complete if p["name"] == program] if program else complete
+            if len(selected) != 1:
+                raise StoreError("请选择一个完整解码的程序块，传 program=文件清单中的完整名称；部分解码禁止写回")
+            parsed = parse_il(selected[0]["il"], title=project.name)
+            if overwrite and (store().project_path(import_into) / "program.il").exists():
+                target_project = store().get(import_into)
+                target_project.cpu = cpu or target_project.cpu
+            else:
+                target_project = store().create(import_into, cpu=cpu or project.cpu, title=project.name)
+            target_project.save(parsed, comments=summary["deviceComments"])
+            base = target_project.root
+            for entry in project.programs():
+                (base / ("program_" + entry.iid + "_" + _safe_name(entry.name) + ".raw.bin")).write_bytes(project.read_stream(entry))
+            summary["storeProject"] = import_into
+            summary["selectedProgram"] = selected[0]["name"]
+            (base / "gxw_manifest.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except (GxwError, ILParseError, StoreError, OSError) as exc:
         summary["importError"] = str(exc)
-    project.close()
+    finally:
+        project.close()
     return json.dumps(summary, ensure_ascii=False, indent=2)
 
 

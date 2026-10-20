@@ -21,7 +21,7 @@ Severity = Literal["error", "warning", "info"]
 DEVICE_LIMITS: dict[str, dict[str, int]] = {
     "Q": {"X": 8192, "Y": 8192, "M": 8192, "L": 8192, "B": 8192, "D": 12288, "W": 8192, "R": 32768, "ZR": 65536, "T": 2048, "C": 1024, "S": 8192},
     "L": {"X": 8192, "Y": 8192, "M": 8192, "L": 8192, "B": 8192, "D": 12288, "W": 8192, "R": 32768, "ZR": 65536, "T": 2048, "C": 1024, "S": 8192},
-    "FX3U": {"X": 1024, "Y": 1024, "M": 7680, "S": 4096, "D": 8000, "R": 32768, "T": 512, "C": 256},
+    "FX3U": {"X": 248, "Y": 248, "M": 7680, "S": 4096, "D": 8000, "R": 32768, "T": 512, "C": 256},
     "FX5U": {"X": 8192, "Y": 8192, "M": 8192, "L": 8192, "D": 12288, "W": 8192, "R": 32768, "ZR": 65536, "T": 2048, "C": 1024},
 }
 
@@ -174,8 +174,18 @@ def validate_program(
                 except DeviceError:
                     continue
                 family = "T" if ref.device in {"TN", "TS", "TC"} else ("C" if ref.device in {"CN", "CS", "CC"} else ref.device)
+                index = ref.index
+                if cpu and cpu.upper().startswith("FX3U"):
+                    if family in {"X", "Y"}:
+                        try:
+                            index = int(operand.strip()[1:], 8)
+                        except ValueError:
+                            issues.append(ValidationIssue("error", "FX_OCTAL_ADDRESS", "FX3U 的 X/Y 地址必须为八进制：" + operand, line=line))
+                            continue
+                    if family in {"M", "D"} and 8000 <= index <= 8511:
+                        continue
                 limit = limits.get(family)
-                if limit is not None and ref.index >= limit:
+                if limit is not None and index >= limit:
                     issues.append(
                         ValidationIssue(
                             "warning",

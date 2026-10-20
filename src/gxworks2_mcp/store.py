@@ -156,6 +156,10 @@ class Store:
         project = Project(name=name, root=self.project_path(name))
         if not project.exists():
             raise StoreError("project " + repr(name) + " does not exist under " + str(self.projects_dir))
+        try:
+            project.cpu = json.loads(project.json_path.read_text(encoding="utf-8")).get("cpu", "Q")
+        except (OSError, ValueError, AttributeError) as exc:
+            raise StoreError("工程元数据无法读取：" + str(exc)) from exc
         return project
 
     def list(self) -> list[dict[str, object]]:

@@ -140,6 +140,8 @@ def compile_rung(rung: dict[str, Any]) -> list[Instruction]:
         raise BuildError("rung needs an out device such as Y0")
     logic = rung.get("logic")
     comment = rung.get("comment")
+    if "preset" in rung:
+        out = str(out) + " " + str(rung["preset"])
     if logic is None:
         lines = ["OUT " + str(out)]
     else:
