@@ -227,12 +227,26 @@ def diff_programs(before: Program, after: Program) -> dict[str, object]:
     left, right = lines(before), lines(after)
     if left == right:
         return {"added": [], "removed": [], "before": len(left), "after": len(right), "changes": []}
+    # Repeated instructions make SequenceMatcher quadratic even for a tiny edit.
+    # Keep equal boundaries out of the matcher without dropping duplicate lines.
+    # Ambiguous repeats are anchored to these boundaries; ranges remain global.
+    start = 0
+    common_length = min(len(left), len(right))
+    while start < common_length and left[start] == right[start]:
+        start += 1
+    left_end, right_end = len(left), len(right)
+    while left_end > start and right_end > start and left[left_end - 1] == right[right_end - 1]:
+        left_end -= 1
+        right_end -= 1
     removed: list[str] = []
     added: list[str] = []
     changes: list[dict[str, object]] = []
-    for operation, i1, i2, j1, j2 in SequenceMatcher(None, left, right, autojunk=False).get_opcodes():
+    for operation, i1, i2, j1, j2 in SequenceMatcher(
+        None, left[start:left_end], right[start:right_end], autojunk=False
+    ).get_opcodes():
         if operation == "equal":
             continue
+        i1, i2, j1, j2 = i1 + start, i2 + start, j1 + start, j2 + start
         removed.extend(left[i1:i2])
         added.extend(right[j1:j2])
         changes.append({"operation": operation, "beforeRange": [i1, i2],
