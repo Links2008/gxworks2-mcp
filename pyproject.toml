@@ -15,16 +15,20 @@ dependencies = ["mcp>=1.2.0", "olefile>=0.46"]
 
 [project.optional-dependencies]
 ui = ["pywinauto>=0.6.8", "pywin32>=306"]
+native = ["pywin32>=306; sys_platform == 'win32'"]
 dev = ["pytest>=8.0", "pyyaml>=6.0"]
 
 [project.scripts]
 gxworks2-mcp = "gxworks2_mcp.server:main"
 
+[tool.setuptools]
+license-files = ["LICENSE", "third-party/*.txt", "third-party/README.md"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-gxworks2_mcp = ["data/*.json"]
+gxworks2_mcp = ["data/*.json", "data/*.gxw", "data/*.cs"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

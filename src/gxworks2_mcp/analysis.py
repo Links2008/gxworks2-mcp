@@ -25,17 +25,13 @@ _OUTPUT_LIKE = {"OUT", "SET", "RST", "PLS", "PLF"}
 
 #: application instructions whose first operand is a destination, second a source, etc.
 _RW_SHAPES = {
-    "MOV": ("W", "R"), "DMOV": ("W", "R"), "MOVP": ("W", "R"),
+    "MOV": ("R", "W"), "DMOV": ("R", "W"), "MOVP": ("R", "W"),
     "ADD": ("R", "R", "W"), "SUB": ("R", "R", "W"), "MUL": ("R", "R", "W"), "DIV": ("R", "R", "W"),
     "DADD": ("R", "R", "W"), "DSUB": ("R", "R", "W"), "DMUL": ("R", "R", "W"), "DDIV": ("R", "R", "W"),
     "INC": ("RW",), "DEC": ("RW",), "DINC": ("RW",), "DDEC": ("RW",),
     "CMP": ("R", "R", "W"), "ZCP": ("R", "R", "R", "W"),
-    "BMOV": ("W", "R", "R"), "FMOV": ("R", "W"),
+    "BMOV": ("R", "W", "R"), "FMOV": ("R", "W", "R"),
 }
-
-
-def _operands(instruction: Instruction) -> list[str]:
-    return [o for o in instruction.operands if DEVICE_OPERAND_RE.match(o)]
 
 
 def where_used(program: Program) -> dict[str, list[dict[str, Any]]]:
@@ -47,7 +43,7 @@ def where_used(program: Program) -> dict[str, list[dict[str, Any]]]:
 
     sites: dict[str, list[dict[str, Any]]] = {}
     for index, instruction in enumerate(program.instructions):
-        operands = _operands(instruction)
+        operands = instruction.operands
         if not operands:
             continue
         if instruction.mnemonic in _OUTPUT_LIKE:

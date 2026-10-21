@@ -975,4 +975,3 @@ def available() -> dict[str, object]:
         report["windows"] = []
         report["window_error"] = str(exc)
     return report
-

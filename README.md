@@ -1,19 +1,53 @@
 # gxworks2-mcp
 
-MCP 服务器：让 AI 直接**写三菱 PLC 梯形图程序**（GX Works2 / MELSEC Q·L·FX），
-并把程序送进 GX Works2、或经 MC 协议与 PLC/模拟器直接读写。
+MCP 服务器：让 AI 编写 **FX3U 梯形图与 SFC 步进程序，直接输出原生 `.gxw`**。
+独立目录为 `E:\trae_projects\gxworks2-mcp`。原生写入不启动 GX Works2，不调用
+computer use、鼠标、键盘、截图或浏览器；软件打开、编译、实体 PLC 验证分别验收。
+
+第二轮优化将中间封装移入内存，并保留最终落盘读回和逐流核验。
+同输入交替基准：梯形图 466→167 ms，SFC 步进程序 439→163 ms。
+范围、测量方法及完整结果见 `docs/第二轮优化验证.md`。
 
 > 定位：**给 AI 一个「写三菱 PLC 程序」的可校验管道**——把结构化逻辑树编译成 MELSEC 助记符程序，
-> 做静态校验，导出成 GX Works2 能用的格式（指令表 CSV / IL 文本），并可用 MC 协议直接读写 PLC。
+> 做静态校验，编码为原生程序流，写入新的 `.gxw`；自动读回源码并校验其他数据流不变。
 >
 > ⚠️ 一个必须说清的事实：**GX Works2 的官方编程语言只有 梯形图 / 结构化梯形图·FBD / SFC / ST，
 > 没有 IL**（它声明符合 IEC 61131-3，但只实现了其中 4 种）。所以 IL 不是 GX Works2 的源语言，
 > 只是它「回路块列表显示/编辑」与「写入至 CSV 文件」的**呈现形式**。本工具产出的 IL/CSV 需要经由
-> 这两条官方通道带进 GX Works2。
+> 这两条通道也能带进 GX Works2。新的 `gx_write_project` 直接写二进制源码，不经过 CSV 导入。
+
+## 快速编写与顺启逆停示例
+
+```python
+gx_program_create(name="motor", cpu="FX3U", rungs=[{"out": "Y0", "logic": "X10"}])
+gx_program_validate(name="motor")
+gx_write_project(name="motor", path=r"E:\工程序列\motor.gxw", confirm=True)
+gx_gxw_open(path=r"E:\工程序列\motor.gxw")
+```
+
+输出目录须存在，文件须为新文件；工具不会覆盖模板或已有工程。默认使用附带的 FX3U
+空白梯形图模板。已有工程需是已验证的简单梯形图源码格式，可显式指定 `template_path`
+和完整 `block` 名称。只修改该源码流及对应历史元数据，其他所有数据流逐字节核验。
+`requiresCompile=true` 表示生成的是原生源码，必须在 GX Works2 编译后才能用于下载。
+
+`examples/fx3u_sequence.py` 提供完整三路顺启逆停示例：X0 上升沿启动、X1 停止优先；
+Y0→Y1→Y2，每段 1 秒；逆停从最后已启动的一路开始立即关闭，再每隔 1 秒关闭下一路。
+启动途中可停止，停止过程中忽略启动，持续按住启动不会在停止后自动重启。
+
+```powershell
+py examples/fx3u_sequence.py E:\工程序列\顺启逆停
+```
+
+生成普通梯形图与 STL/RET 顺控两份 `.gxw`、对应 `.il` 和步骤 JSON。
+测试包含独立扫描执行器的时序与边界检查；执行器仅覆盖示例使用的基本指令及 T0..T3，
+不等于实体 PLC 或完整 GX Simulator2。软件验收边界见 `docs/原生写入与验证.md`。
 
 ## 它解决什么问题
 
-GX Works2 没有公开自动化 API，工程文件 .gxw 是二进制复合文档。能落地的只有两条路：
+工程文件 `.gxw` 是二进制复合文档，目前提供以下通路：
+
+0. **原生源码写入（默认）**：FX3U 梯形图或结构化顺控 → 校验 → 编码 → IStorage 封装 →
+   源码与非目标流读回校验。不依赖 GX Works2 是否运行；Windows 需要 pywin32。
 
 1. **文本/CSV 路线（写程序）**：GX Works2 有两条「助记符形态」的官方通道——
    「回路块列表显示/编辑」（Ver.1.86Q+）与「写入至 CSV 文件」（7 列、UTF-16 LE、Tab 分隔）。
@@ -25,8 +59,8 @@ GX Works2 没有公开自动化 API，工程文件 .gxw 是二进制复合文档
    （iID==内层流号，MAIN.res/POU/任务/参数全部定位），Q 系列的 MAIN.res 程序体已能解码回 IL
    （语法经「写入→保存→读回」闭环逐字节对撞验证，见 re-evidence/GRAMMAR.md；
    未知构造一律停止并报 stopReason，绝不编造指令）；
-   **结构化工程的 .pou 程序体同样能解码**（网络记录 + 元数据尾切分，实测你本地工程
-   Block1 coverage 1.0 / Block 0.78），FX 与 Q 两族都支持。
+   简单梯形图源码和部分网络记录可解码；任何不完整网络均返回 stopReason 和 partialIl，
+   不会被物化成可覆盖原工程的完整源码。FX3U 原生 SFC 图形使用 `gx_sfc_read` 完整读取。
 2. **MC 协议路线（连 PLC）**：QnA 兼容 3E 帧，字节序/设备码/位打包已与参考实现逐字节比对，
    并已按三菱官方手册 SH-080008 校验。直接读写软元件、远程 RUN/STOP/PAUSE/latch clear。
 
@@ -34,15 +68,52 @@ GX Works2 没有公开自动化 API，工程文件 .gxw 是二进制复合文档
 
 ## SFC（顺控程序）支持
 
+### 原生 SFC 图形：本机 1.620 已验证
+
+`gx_sfc_write` 一次完成图形创建、步骤动作和条件注册、原生整工程转换、完整程序检查、
+保存导出，以及磁盘读回。使用安装的 GX Works2 1.620.0.1 原生接口和 FX 14.67 转换器，
+不启动 GD2，不调用 computer use、鼠标、键盘、截图或 UI Automation。
+同一时间最多一个按需 x86 辅助进程，完成或失败后退出；不连接 PLC。
+
+```python
+from examples.fx3u_sequence import native_sequence_spec
+
+gx_sfc_write(
+    spec=native_sequence_spec(),
+    path=r"E:\工程序列\顺启逆停_原生SFC.gxw",
+    template_path=r"E:\工程序列\FX3U_SFC模板.gxw",
+    installation_root=r"D:\新建文件夹",
+    confirm=True,
+)
+gx_sfc_read(path=r"E:\工程序列\顺启逆停_原生SFC.gxw")
+```
+
+模板目前须为 `Block.Program.pou` 图形、`Block1.Program.pou` 连续扫描块及 `MAIN.res`
+组成的 FX3U/FX3UC 工程。`spec` 使用 `initial/preamble/steps`，步骤包含
+`state/actions/transitions`。支持顺序、双路选择和显式跳转；暂不支持并行分支及任意模板布局。
+输出须为新文件；未知原生版本、未知数据流变化、编译错误或读回差异均阻止发布。
+安装目录可省略，由本机注册信息或 `GXWORKS2_INSTALL_ROOT` 取得。
+
+该示例为 6 步、8 转移、1 秒间隔。输出集中驱动，避免重复线圈；首次扫描清理旧步骤，
+同时按启停不产生延迟启动，持续按住启动不自动重启。完整编译检查实测约 6.6 秒；
+纯文件 `gx_sfc_read` 约 12 毫秒，不启动任何辅助进程。每次写入返回独立阶段耗时和原生诊断。
+原生编译及读回通过与实体 PLC 验证是不同的验收层；本项目没有自动下载或驱动实体设备。
+
+### 指令表与结构预览
+
 GX Works2 的 FX 系列顺控程序在指令表里就是 **STL 步进梯形**（`STL S0 … RET`），
 本服务器全链路支持：
 
 - `gx_program_create(name, cpu, il='STL S0\nOUT Y10\nLD X10\nOUT S8\nRET\n…\nEND')`
-- 校验（gx_program_validate）→ CSV 导出（gx_program_export_csv）→ 无鼠标导入（gx_import_csv）
+- 支持 `sfc={initial, preamble, steps:[{state, actions, transitions}]}` 结构化生成。
+- 定时器动作使用 `{out:"T0", preset:"K10"}`；条件复用梯形图 and/or/not/rise/fall。
+- 校验（gx_program_validate）→ 原生写入（gx_write_project）→ 源码读回（gx_gxw_open）
 - 从 .gxw 解码回来的顺控程序、以及新建的顺控程序，都能用
   gx_where_used / gx_trace_device（转移条件追踪）/ gx_lint_program 分析
 
-SFC 语言编辑器（图形块）的原生 .pou 记录格式仍在逆向边界内，见 re-evidence/GRAMMAR.md。
+`gx_sfc_preview` 保留远端已有的只读结构预览，始终返回 `runnable=false`，其表结构与
+原生写入的 `spec` 不同。指令表源码导出的文件仍需编译；原生图形闭环见
+`docs/原生SFC_1620验证.md`，记录格式见 `re-evidence/GRAMMAR.md`。
 
 ## 安装
 
@@ -72,15 +143,15 @@ CSV 路径，不重复回显整个 IL/ASCII。需要预览时传 `preview=true`�
 
 ```bash
 cd gxworks2-mcp
-py -m pip install -e ".[dev]"            # 开发用；仅运行时用 pip install .
-py -m pip install pywinauto pyperclip    # 可选：只有要用「粘贴进 GX Works2」才需要
+py -m pip install -e ".[native,dev]"     # Windows 原生写入与测试
+# 界面自动化只在明确需要时安装 .[ui]，原生写入不需要它
 ```
 
 验证：
 
 ```bash
 py -m pytest -q                          # 离线测试，不需要 PLC / GX Works2
-py tests/verify_dsh_launch.py            # 按 DSH 的启动方式握手并调用工具
+py tests/test_stdio_e2e.py              # 真实 MCP 握手、梯形图/SFC 原生写入与读回
 ```
 
 ## 接入 DSH（DeepSeek Harness）
@@ -97,11 +168,11 @@ DSH 用 @deepseek-ai/dsh-mcp-client 桥接外部 MCP 服务器，每台服务器
     transport: stdio
     command: py
     args: ['-m', 'gxworks2_mcp']
-    cwd: E:/trae_projects/Linkshub/gxworks2-mcp
+    cwd: E:/trae_projects/gxworks2-mcp
     env:
-      PYTHONPATH: E:/trae_projects/Linkshub/gxworks2-mcp/src
+      PYTHONPATH: E:/trae_projects/gxworks2-mcp/src
       PYTHONIOENCODING: utf-8
-      GXWORKS2_MCP_HOME: E:/trae_projects/Linkshub/gxworks2-mcp/.mcp-cache
+      GXWORKS2_MCP_HOME: E:/trae_projects/gxworks2-mcp/.mcp-cache
     toolCallTimeoutMs: 120000
 ```
 
@@ -117,6 +188,7 @@ DSH 用 @deepseek-ai/dsh-mcp-client 桥接外部 MCP 服务器，每台服务器
 | 工具 | 作用 |
 |---|---|
 | gx_program_create | 建工程 + 用「逻辑树」或 IL 初始化程序 |
+| gx_write_project | 无窗口直接输出新的 FX3U `.gxw`，自动读回并逐流校验 |
 | gx_program_add_rungs | 追加梯形图行（逻辑树自动编译成 IL） |
 | gx_program_replace | 用整段 IL 覆盖程序，返回 diff 与校验结果 |
 | gx_program_read | 读回 IL / ASCII 梯形图 / 布尔逻辑 / 结构 |
@@ -221,26 +293,29 @@ devices.csv     # 软元件注释（可导入 GX Works2）
 
 ## 已知边界（重要）
 
-- **直读 .gxw 已到「清单+框架」级，指令语法逆向进行中**：结构（哪些程序体、多大、哈希、
-  记录边界）不依赖 GX Works2 已能读取，且本机差分语料证明「一次已知编辑只改第一个记录的
-  size（113→92），后续锚点按该差值平移」。把字节变回 LD/OUT/ANB 序列需要记录语法——
-  re-evidence/README.md 已把样本、锚点、反例打包为逆向任务（配合 REA 或继续人工比对）。
-- **写入 = CSV 通路（已实测），不是粘贴 IL**：1.620W 实测 Ctrl+V 无效（gx_paste_ladder 遗留）。
+- **解析范围按程序体报告**：简单梯形图源码可完整读回；结构化网络和原生 SFC 图形遇到
+  未知结构立即停止，不把 partialIl 作为完整程序保存。应使用 `.Program.pou` 读取当前源码；
+  `.res` 可能是上次编译缓存，源代码修改后两者不一定一致。
+- **默认写入为无窗口 GXW 源码通路**：只创建新文件，拒绝覆盖；其他流逐字节核验。
+  编译缓存仍需由 GX Works2 更新。原生 SFC 图形画布的直接新建尚未实现。
+- **旧 CSV 通路保留为备选**：1.620W 实测 Ctrl+V 无效（gx_paste_ladder 遗留）。
   gx_import_csv 驱动 编辑→「从CSV文件读取」：实测梯形图 2 步变 7 步、F4 编译无报错。
   官方对话框明说导入是**整块替换**，一个 CSV = 一个完整程序块，confirm=true 才执行。
 - **CSV 导入是「实测可用」而非「官方承诺」**：官方 FAQ 只承诺设备注释 CSV 双向（1.64S+），
   对程序 CSV 导入没有任何书面承诺——但 UI 与功能在本机 1.620W 中文版实测成立。列头按语言变化
   （中文「步号/指令」，日文「ステップ番号/命令」），gx_program_export_csv 的 locale 参数控制。
   导入后务必执行 程序检查（F4 + gx_program_validate 复核）。
-- **软元件限制**：S（步进继电器）**只读**，写它会被工具直接拒绝；X/Y/B/W/SB/SW/DX/DY/ZR 是
-  十六进制寻址，其余十进制；FX 系列下 X010 这类前导 0 可能是八进制，视 CPU 参数而定。
+- **软元件限制**：MC 外部通信的 S 步进继电器写入被拒绝；PLC 程序内的 SET S/STL S 正常支持。
+  FX3U 原生源码的 X/Y 严格按八进制处理，X8、Y9 等直接报错；原 MC 客户端仍使用 Q/L 规则，
+  本轮未扩展 FX3U MC 寻址，不能拿它的 Q/L 数字解释直接驱动 FX3U。
 - **GX Simulator2 不能直连 MC 协议**（三菱 FAQ：需 MX Component；模拟器是隔离进程），
   所以 plc_probe 对着模拟器端口连不上属于预期。
 - **远程 RUN 不可只看结束码**：三菱手册说明 CPU 的 RUN/STOP 物理开关在 STOP 时，
   远程 RUN 仍返回正常完成。因此 plc_remote_control 在 run/stop 后会**回读 SM0** 确认状态。
 - **MC 协议写入**默认被拦截（allow_write=false），因为写错地址会真的动设备。
 - 设备代码表按 QnA 兼容 3E 帧整理；FX 系列走同一套代码，个别机型扩展区需按手册核对。
-- 未实现：在线监视（monitor 指令）、.gxw 工程文件二进制读写、ST/SFC 语言生成。
+- 未实现：在线监视、ST 生成、原生 SFC 图形画布新建、通用厂商编译器替代。
+  已实现 FX3U 简单梯形图和 STL/RET 顺控的原生源码写入。
 
 ## 事实出处
 
@@ -270,10 +345,9 @@ src/gxworks2_mcp/
   ui.py          GX Works2 窗口自动化（可选）
   compat.py      MCP SDK 1.x / 2.x 兼容层
   server.py      MCP 工具定义
-tests/           62 个离线测试 + stdio 端到端 + pymcprotocol 交叉验证
+tests/           离线回归、顺控扫描时序、原生 GXW 写入与 stdio 端到端验证
 ```
 
 ## License
 
 MIT
-

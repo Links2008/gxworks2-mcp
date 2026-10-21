@@ -108,4 +108,3 @@ def test_for_single_loop_count_roundtrip(tmp_path):
     program = parse_il('FOR K1\nLD X1\nOUT Y1\nNEXT\nEND')
     path = write_program_csv(program, tmp_path / 'for.csv')
     assert read_program_csv(path).to_il() == 'FOR K1\nLD X1\nOUT Y1\nNEXT\nEND'
-

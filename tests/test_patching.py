@@ -237,4 +237,3 @@ def test_temporary_project_locks_are_not_cached_forever(tmp_path):
             pass
     gc.collect()
     assert len(locking._locks) <= before
-

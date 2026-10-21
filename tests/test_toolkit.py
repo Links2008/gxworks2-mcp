@@ -239,7 +239,7 @@ def test_validation_flags_unbalanced_orb():
 
 
 def test_validation_warns_out_of_range_device():
-    codes = {issue.code for issue in validate_program(parse_il("LD X9999\nOUT Y0\nEND"), cpu="FX3U")}
+    codes = {issue.code for issue in validate_program(parse_il("LD X400\nOUT Y0\nEND"), cpu="FX3U")}
     assert "DEVICE_OUT_OF_RANGE" in codes
 
 

@@ -17,7 +17,7 @@ def test_cpu_survives_reopen_and_save(tmp_path, cpu):
 
 
 def test_reopened_fx_keeps_cpu_specific_validation(tmp_path):
-    Store(tmp_path).create('fx', cpu='FX3U', initial_il='LD M8000\nOUT Y1\nEND')
+    Store(tmp_path).create('fx', cpu='FX3U', initial_il='LD M7680\nOUT Y1\nEND')
     project = Store(tmp_path).get('fx')
     issues = validate_program(project.read_program(), cpu=project.cpu)
     assert any('FX3U' in issue.message for issue in issues)

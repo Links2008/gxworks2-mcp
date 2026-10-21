@@ -247,4 +247,3 @@ def coerce_program(source: str | Program | Iterable[Instruction | str]) -> Progr
             if parsed is not None:
                 program.append(parsed)
     return program
-

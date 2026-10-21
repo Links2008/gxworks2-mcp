@@ -281,4 +281,3 @@ def _device_sort_key(text: str) -> tuple[int, str]:
     if not match:
         return (0, text)
     return (int(match.group(2)), match.group(1))
-
