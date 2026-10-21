@@ -24,6 +24,7 @@ import csv
 import io
 import json
 import re
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -156,6 +157,21 @@ class Store:
         project = Project(name=name, root=self.project_path(name))
         if not project.exists():
             raise StoreError("project " + repr(name) + " does not exist under " + str(self.projects_dir))
+        try:
+            metadata = json.loads(project.json_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            # Legacy IL-only workspaces did not persist a CPU selection.
+            return project
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise StoreError(f"cannot read metadata for project {name!r}: {exc}") from exc
+        if not isinstance(metadata, dict):
+            raise StoreError(f"invalid metadata for project {name!r}: expected an object")
+        cpu = metadata.get("cpu", "Q")
+        # GXW imports deliberately use an empty CPU for an unidentified family.
+        # Preserve that state rather than silently selecting Q-specific limits.
+        if not isinstance(cpu, str) or (cpu and not cpu.strip()):
+            raise StoreError(f"invalid CPU metadata for project {name!r}: expected a CPU string")
+        project.cpu = cpu
         return project
 
     def list(self) -> list[dict[str, object]]:
@@ -186,17 +202,33 @@ class Store:
 
 
 def diff_programs(before: Program, after: Program) -> dict[str, object]:
-    """Line-level diff between two programs, for review before writing to a project."""
+    """Order-sensitive instruction diff; comments and display steps are excluded.
 
-    left = [str(instruction) for instruction in before.instructions]
-    right = [str(instruction) for instruction in after.instructions]
-    removed = [line for line in left if line not in right]
-    added = [line for line in right if line not in left]
+    Labels are included because changing a jump target changes program behavior.
+    Change ranges are zero-based, half-open instruction indexes.
+    """
+
+    def lines(program: Program) -> list[str]:
+        return [(f"{item.label}: " if item.label else "") + str(item)
+                for item in program.instructions]
+
+    left, right = lines(before), lines(after)
+    removed: list[str] = []
+    added: list[str] = []
+    changes: list[dict[str, object]] = []
+    for operation, i1, i2, j1, j2 in SequenceMatcher(None, left, right, autojunk=False).get_opcodes():
+        if operation == "equal":
+            continue
+        removed.extend(left[i1:i2])
+        added.extend(right[j1:j2])
+        changes.append({"operation": operation, "beforeRange": [i1, i2],
+                        "afterRange": [j1, j2], "removed": left[i1:i2], "added": right[j1:j2]})
     return {
         "added": added,
         "removed": removed,
         "before": len(left),
         "after": len(right),
+        "changes": changes,
     }
 
 
@@ -221,3 +253,4 @@ def _device_sort_key(text: str) -> tuple[int, str]:
     if not match:
         return (0, text)
     return (int(match.group(2)), match.group(1))
+

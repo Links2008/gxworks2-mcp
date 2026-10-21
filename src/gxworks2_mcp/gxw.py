@@ -557,8 +557,10 @@ def _pou_records(payload):
             and m3 == 12
             and payload[i + 20 : i + 24] == marker_zero
             and payload[i + 24 : i + 28] == marker_ff
-            and 0 < size <= n - i - 28
+            and size > 0
         ):
+            # Keep recognized truncated records visible to the decoder. Silently
+            # scanning past them could turn a damaged program into a success.
             yield (i, size, payload[i + 28 : i + 28 + size])
             i += 28 + size
         else:
@@ -598,50 +600,93 @@ def pou_stream(payload):
     Anything outside the proven operator table is counted, never guessed.
     """
 
-    from .il import Instruction, Program, render_il
+    from .il import ILParseError, Instruction, Program, parse_il, render_il
 
     program = Program()
     networks = 0
     skipped = 0
+    failures = []
+    records = 0
+    partial_lines = []
 
-    for _off, _size, body in _pou_records(payload):
+    for index, (offset, size, body) in enumerate(_pou_records(payload)):
+        records += 1
+        if len(body) != size:
+            failures.append({
+                "networkIndex": index, "recordOffset": offset,
+                "stopReason": "network record payload truncated",
+                "declaredBytes": size, "availableBytes": len(body),
+            })
+            continue
         tokens = _strip_network_trailer(body)
         if not tokens:
+            # Only a recognized metadata-only record may be skipped. Unknown
+            # non-empty records are failures, not harmless metadata.
             skipped += 1
             continue
         attempt = main_res_program(struct.pack("<I", len(tokens)) + tokens, body_len_offset=0)
-        text = attempt.get("il") if attempt.get("decoded") else attempt.get("partialIl")
-        if not text or not text.strip():
-            skipped += 1
+        # A structured network need not carry END. This is the sole recoverable
+        # MAIN.res failure: the whole token run must have decoded, without an
+        # unknown operator, unreadable operand, or truncated record.
+        complete = attempt.get("decoded") or (
+            attempt.get("stopReason") == "stream ended without END/FEND"
+            and attempt.get("consumedBytes") == len(tokens)
+        )
+        text = attempt.get("il") if attempt.get("decoded") else attempt.get("partialIl", "")
+        if not complete:
+            failures.append({
+                "networkIndex": index, "recordOffset": offset,
+                "stopReason": attempt.get("stopReason", attempt.get("error", "network not decoded")),
+                "consumedBytes": attempt.get("consumedBytes", 0),
+                "tokenBytes": len(tokens), "partialIl": text,
+            })
+            if not failures[:-1] and text:
+                partial_lines.extend(text.splitlines())
+            continue
+        try:
+            decoded = parse_il(text)
+        except ILParseError as exc:
+            failures.append({
+                "networkIndex": index, "recordOffset": offset,
+                "stopReason": "decoded IL could not be parsed: " + str(exc),
+                "partialIl": text,
+            })
             continue
         networks += 1
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line == "END":
-                continue
-            mnemonic, _, operands = line.partition(" ")
-            operands, _, comment = operands.partition("  // ")
-            ins = Instruction(mnemonic, [operands.strip()] if operands.strip() else [])
-            if comment:
-                ins.comment = comment.strip()
-            program.append(ins)
+        instructions = [ins for ins in decoded.instructions if ins.mnemonic != "END"]
+        program.extend(instructions)
+        if not failures:
+            partial_lines.extend(render_il(Program(instructions)).splitlines())
+
+    if failures:
+        # Never expose an editable IL or synthesize END across unknown data.
+        # partialIl is only the contiguous prefix before the first failure.
+        return {
+            "decoded": False,
+            "coverage": min(0.999, round(networks / max(1, networks + len(failures)), 3)),
+            "framing": "network-records",
+            "networks": networks, "skippedNetworks": skipped,
+            "failedNetworks": failures,
+            "stopReason": "network " + str(failures[0]["networkIndex"])
+                + " at " + hex(failures[0]["recordOffset"]) + ": " + failures[0]["stopReason"],
+            "partialIl": "\n".join(partial_lines),
+        }
 
     if not program.instructions:
-        # last resort: a continuous stream ending in END (simple projects)
-        first = payload.find(bytes.fromhex("030003"))
-        if first >= 0:
-            end = payload.find(bytes.fromhex("04340204"), first)
-            if end > first:
-                stream = payload[first : end + 4]
-                attempt = main_res_program(struct.pack("<I", len(stream)) + stream, body_len_offset=0)
-                if attempt.get("decoded"):
-                    return {
-                        "decoded": True,
-                        "coverage": 1.0,
-                        "framing": "continuous-token-stream",
-                        "il": attempt["il"],
-                        "devices": attempt["devices"],
-                    }
+        # A recognized record must not be bypassed by finding a convenient
+        # continuous token fragment inside it.
+        if not records:
+            # Decode the entire body, never a convenient LD...END fragment
+            # hidden inside unknown framing or followed by unparsed data.
+            attempt = main_res_program(struct.pack("<I", len(payload)) + payload, body_len_offset=0)
+            if attempt.get("decoded") and attempt.get("consumedBytes") == len(payload):
+                return {
+                    "decoded": True,
+                    "coverage": 1.0,
+                    "framing": "continuous-token-stream",
+                    "il": attempt["il"],
+                    "devices": attempt["devices"],
+                }
         return {
             "decoded": False,
             "coverage": 0.0,
@@ -651,11 +696,10 @@ def pou_stream(payload):
     program.append(Instruction("END"))
     return {
         "decoded": True,
-        "coverage": round(networks / max(1, networks + skipped), 3),
+        "coverage": 1.0,
         "framing": "network-records",
         "networks": networks,
         "skippedNetworks": skipped,
         "il": render_il(program),
         "devices": program.devices(),
     }
-
