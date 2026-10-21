@@ -34,6 +34,7 @@ from .blocks import ladder_blocks, render_ascii, to_boolean
 from .devices import DeviceError, parse_device
 from .il import Program, instruction_count, parse_il, render_il
 from .validate import summarize, validate_program
+from .locking import project_lock
 
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -90,6 +91,11 @@ class Project:
 
     def save(self, program: Program, *, comments: dict[str, str] | None = None) -> dict[str, object]:
         """Persist IL, structured JSON and device comments; return a write report."""
+
+        with project_lock(self):
+            return self._save_unlocked(program, comments=comments)
+
+    def _save_unlocked(self, program: Program, *, comments: dict[str, str] | None = None) -> dict[str, object]:
 
         self.root.mkdir(parents=True, exist_ok=True)
         il_text = render_il(program)
@@ -201,9 +207,10 @@ class Store:
 
     def delete(self, name: str) -> None:
         project = self.get(name)
-        for child in sorted(project.root.rglob("*"), reverse=True):
-            child.unlink() if child.is_file() else child.rmdir()
-        project.root.rmdir()
+        with project_lock(project):
+            for child in sorted(project.root.rglob("*"), reverse=True):
+                child.unlink() if child.is_file() else child.rmdir()
+            project.root.rmdir()
 
 
 def diff_programs(before: Program, after: Program) -> dict[str, object]:

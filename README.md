@@ -62,6 +62,12 @@ CSV 路径，不重复回显整个 IL/ASCII。需要预览时传 `preview=true`�
 `gx_import_csv(confirm=true)`，并在导入后编译、检查。详情与可重复基准见
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md)。
 
+增量修改用 `gx_program_slice` 读取稳定指令 ID 与版本，再用 `gx_program_patch`
+批量修改并刷新 CSV；旧版本拒绝写入。`gx_sfc_preview` 提供步骤表结构检查，
+但始终返回 `runnable=false`，尚不是 SFC 编译器。导入后可调用
+`gx_verify_import` 通过新导出 CSV 核对内容；仅提供一个 CSV 文件时只做离线比较，
+不会冒称实机导入验证。详见 [docs/EDIT_AND_VERIFY.md](docs/EDIT_AND_VERIFY.md)。
+
 需要 Python 3.10+。
 
 ```bash

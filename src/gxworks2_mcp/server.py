@@ -36,6 +36,7 @@ import json
 import os
 import sys
 import tempfile
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,10 @@ from .mcprotocol import MCClient, MCConfig, MCProtocolError, probe as mc_probe
 from .store import Store, StoreError, device_usage, diff_programs
 from .compat import SDK_GENERATION, create_server, run_server
 from .validate import _cpu_limits, summarize, validate_program
+from .verification import compare_programs
+from .locking import project_lock
+from .patching import PatchError, PatchWriteError, VersionConflict, apply_patch, read_patch_view
+from .sfc import SFCError, preview_sfc
 
 DEFAULT_WORKSPACE = Path(os.environ.get("GXWORKS2_MCP_HOME", Path.home() / ".gxworks2-mcp"))
 
@@ -66,7 +71,9 @@ _INSTRUCTIONS = (
     "save locally and export CSV in ONE call with a compact response. Do not append "
     "one rung per tool call. This does not automate the native graphical SFC editor. "
     "Then gx_import_csv requires explicit replacement confirmation, followed by "
-    "gx_compile_csv and gx_save_project. Legacy flow: "
+    "gx_compile_csv, gx_verify_import for fresh content readback, and gx_save_project. "
+    "For local edits use gx_program_slice then gx_program_patch with the returned version. "
+    "gx_sfc_preview is structure-only and never emits runnable SFC. Legacy flow: "
     "gx_program_create with rungs -> gx_program_validate -> gx_program_export_csv -> "
     "gx_import_csv (confirm=true; drives GX Works2's Edit > Read from CSV file through UIA, "
     "no mouse or foreground focus needed) -> gx_compile_csv -> gx_save_project. "
@@ -88,6 +95,22 @@ def store() -> Store:
 
 
 # --- program authoring ------------------------------------------------------
+
+@server.tool()
+def gx_sfc_preview(table: dict[str, Any]) -> str:
+    """Validate a single-active-step FX3U state table and preview its structure.
+
+    This is NOT a runnable SFC/STL compiler. Returns runnable=false even when
+    structure is valid because scan-overlap, initialization and reset semantics
+    still need dedicated verification. No files, UI or PLC operations occur.
+    Table fields: cpu, initial, startup, reset, steps. Each step has id, state,
+    actions, and optionally transition={when: contact logic, to: step id}.
+    """
+    try:
+        return json.dumps(preview_sfc(table), ensure_ascii=False)
+    except SFCError as exc:
+        return json.dumps({"valid": False, "runnable": False, "error": str(exc)}, ensure_ascii=False)
+
 
 @server.tool()
 def gx_program_prepare(
@@ -148,7 +171,7 @@ def gx_program_prepare(
             phase = "csv_publish"
             csv_path = project.root / (name + ".csv")
             os.replace(staged_csv, csv_path)
-    except (BuildError, ILParseError, DeviceError, StoreError, OSError) as exc:
+    except (BuildError, ILParseError, DeviceError, StoreError, CSVFormatError, OSError) as exc:
         return json.dumps({"prepared": False, "error": str(exc), "phase": phase,
                            "projectMayBeModified": project_may_be_modified,
                            "csvUpdated": False, "doNotImport": True,
@@ -264,6 +287,59 @@ def gx_program_replace(name: str, il: str) -> str:
         ensure_ascii=False,
         indent=2,
     )
+
+
+@server.tool()
+def gx_program_slice(name: str, start: int = 0, limit: int = 50) -> str:
+    """Read a bounded instruction slice with stable IDs and a version for local patching.
+
+    IDs refer to instructions, NOT inferred rung boundaries. Follow nextStart for
+    more context. External rewrites invalidate IDs; fetch a fresh slice on conflict.
+    """
+    try:
+        return json.dumps(read_patch_view(store().get(name), start=start, limit=limit), ensure_ascii=False)
+    except (StoreError, PatchError, OSError, ValueError) as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+
+@server.tool()
+def gx_program_patch(name: str, expected_version: str, operations: list[dict[str, Any]],
+                     export_csv: bool = True, locale: str = "zh") -> str:
+    """WRITE local instruction edits by stable ID, with mandatory version check.
+
+    Each operation has op (insert_before/insert_after/replace/delete), target_id,
+    and il (except delete). Read gx_program_slice first. The entire resulting
+    program is validated. By default refreshes CSV within the same call; never
+    imports it or accesses a PLC. Use versioned patches for cooperative editing;
+    old whole-program tools have no stale-version protection. Process crashes
+    are not a multi-file transaction; inspect any reported partial-write error.
+    """
+    if locale not in {"zh", "ja", "en"}:
+        return json.dumps({"applied": False, "error": "locale must be zh, ja or en"})
+    try:
+        project = store().get(name)
+        with project_lock(project):
+            result = apply_patch(project, expected_version, operations)
+            result.update({"applied": True, "imported": False, "csvUpdated": False})
+            if export_csv:
+                try:
+                    fresh = store().get(name)
+                    path = write_program_csv(fresh.read_program(), fresh.root / (name + ".csv"),
+                                             project_name=name, cpu_label=fresh.cpu, locale=locale)
+                    result.update({"csvUpdated": True, "csv": str(path)})
+                except (OSError, CSVFormatError, ILParseError) as exc:
+                    result.update({"csvError": str(exc), "doNotImport": True})
+            else:
+                result["doNotImport"] = True
+            return json.dumps(result, ensure_ascii=False)
+    except VersionConflict as exc:
+        return json.dumps({"applied": False, "conflict": True, "error": str(exc),
+                           "hint": "read a fresh slice and reconsider the patch; do not blindly retry"})
+    except PatchWriteError as exc:
+        return json.dumps({"applied": False, "error": str(exc), "rollbackComplete": exc.rollback_complete,
+                           "doNotImport": True})
+    except (StoreError, PatchError, OSError, ValueError) as exc:
+        return json.dumps({"applied": False, "error": str(exc)}, ensure_ascii=False)
 
 
 @server.tool()
@@ -409,7 +485,7 @@ def gx_program_export_csv(
         written = write_program_csv(
             program, target, project_name=project.name, cpu_label=cpu_label, locale=locale
         )
-    except OSError as exc:
+    except (OSError, CSVFormatError) as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)
     return json.dumps(
         {
@@ -718,7 +794,7 @@ def gx_import_csv(
         target = str(store_project.root / (store_project.name + ".import.csv"))
         try:
             write_program_csv(program, target, project_name=store_project.name)
-        except OSError as exc:
+        except (OSError, CSVFormatError) as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
     if not target:
         return json.dumps({"error": "pass csv_path or project"}, ensure_ascii=False)
@@ -727,6 +803,58 @@ def gx_import_csv(
     except ui.AutomationError as exc:
         return json.dumps({"error": str(exc), "csv": target}, ensure_ascii=False)
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@server.tool()
+def gx_verify_import(
+    name: str,
+    readback_path: str = "",
+    title_hint: str = "",
+    compare_comments: bool = True,
+) -> str:
+    """Compare stored instructions with a separate GX Works2 CSV readback.
+
+    With readback_path, compares that file only and does NOT claim a live import
+    was verified. Without it, exports the currently open GX Works2 program to a
+    unique temporary CSV using the existing Windows UI bridge, then compares.
+    Never imports, compiles, saves a GXW, or connects to PLC hardware. Matching
+    content is not evidence of runtime safety or successful compilation.
+    """
+    try:
+        project = store().get(name)
+        before = project.il_path.read_bytes()
+        expected = parse_il(before.decode("utf-8"), title=name)
+        version = hashlib.sha256(before).hexdigest()
+
+        def verify(path: str, live: bool) -> dict[str, Any]:
+            actual = read_program_csv(path).to_program(title=name)
+            if project.il_path.read_bytes() != before:
+                return {"verified": False, "error": "expected project changed during readback; retry",
+                        "expectedVersion": version, "liveReadback": live}
+            comparison = compare_programs(expected, actual, compare_comments=compare_comments)
+            return {"verified": live and comparison["matches"], "liveReadback": live,
+                    "source": "gxworks2_export" if live else "provided_csv",
+                    "expectedVersion": version, **comparison,
+                    "compiled": False, "hardwareValidated": False,
+                    "note": "content comparison only; provided CSV provenance/freshness is not established" if not live
+                    else "fresh UI export compared; compilation and runtime validation remain separate"}
+
+        if readback_path:
+            result = verify(readback_path, False)
+        else:
+            from . import ui
+            with tempfile.TemporaryDirectory(prefix="gx-readback-") as directory:
+                path = str(Path(directory) / "readback.csv")
+                try:
+                    report = ui.export_program_csv(path, title_hint=title_hint or None)
+                except ui.AutomationError as exc:
+                    return json.dumps({"verified": False, "error": str(exc), "liveReadback": False})
+                if not report.get("ok") or not Path(path).is_file():
+                    return json.dumps({"verified": False, "error": "fresh GX Works2 export was not produced"})
+                result = verify(path, True)
+        return json.dumps(result, ensure_ascii=False)
+    except (StoreError, CSVFormatError, ILParseError, DeviceError, OSError, UnicodeError) as exc:
+        return json.dumps({"verified": False, "error": str(exc)}, ensure_ascii=False)
 
 
 @server.tool()
