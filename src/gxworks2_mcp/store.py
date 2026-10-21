@@ -144,12 +144,17 @@ class Store:
             )
         return self.projects_dir / name
 
-    def create(self, name: str, *, cpu: str = "Q", title: str = "", initial_il: str = "") -> Project:
+    def create(self, name: str, *, cpu: str = "Q", title: str = "", initial_il: str = "",
+               initial_program: Program | None = None) -> Project:
+        if initial_program is not None and initial_il:
+            raise StoreError("pass either initial_program or initial_il, not both")
+        program = initial_program if initial_program is not None else (
+            parse_il(initial_il, title=title or name) if initial_il else Program(title=title or name)
+        )
         project = Project(name=name, root=self.project_path(name), cpu=cpu)
         if project.exists():
             raise StoreError("project " + repr(name) + " already exists at " + str(project.root))
         project.root.mkdir(parents=True, exist_ok=False)
-        program = parse_il(initial_il, title=title or name) if initial_il else Program(title=title or name)
         project.save(program)
         return project
 
@@ -213,6 +218,8 @@ def diff_programs(before: Program, after: Program) -> dict[str, object]:
                 for item in program.instructions]
 
     left, right = lines(before), lines(after)
+    if left == right:
+        return {"added": [], "removed": [], "before": len(left), "after": len(right), "changes": []}
     removed: list[str] = []
     added: list[str] = []
     changes: list[dict[str, object]] = []

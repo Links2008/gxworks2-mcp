@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -55,17 +56,23 @@ from .il import ILParseError, Program, instruction_count, parse_il, render_il
 from .mcprotocol import MCClient, MCConfig, MCProtocolError, probe as mc_probe
 from .store import Store, StoreError, device_usage, diff_programs
 from .compat import SDK_GENERATION, create_server, run_server
-from .validate import summarize, validate_program
+from .validate import _cpu_limits, summarize, validate_program
 
 DEFAULT_WORKSPACE = Path(os.environ.get("GXWORKS2_MCP_HOME", Path.home() / ".gxworks2-mcp"))
 
 _INSTRUCTIONS = (
-    "Author MELSEC ladder programs for GX Works2. Verified end-to-end flow: "
+    "Author MELSEC ladder programs for GX Works2. Prefer gx_program_prepare: send ALL "
+    "rungs in one batch, or complete IL (including FX STL/RET sequences), to validate, "
+    "save locally and export CSV in ONE call with a compact response. Do not append "
+    "one rung per tool call. This does not automate the native graphical SFC editor. "
+    "Then gx_import_csv requires explicit replacement confirmation, followed by "
+    "gx_compile_csv and gx_save_project. Legacy flow: "
     "gx_program_create with rungs -> gx_program_validate -> gx_program_export_csv -> "
     "gx_import_csv (confirm=true; drives GX Works2's Edit > Read from CSV file through UIA, "
     "no mouse or foreground focus needed) -> gx_compile_csv -> gx_save_project. "
-    "The CSV import REPLACES the current ladder program. Verify runtime behaviour with "
-    "plc_read. gx_paste_ladder is legacy: pasting IL text does nothing on GX Works2 1.620W."
+    "The CSV import REPLACES the current ladder program. Offline validation does not "
+    "prove hardware safety. Do not connect to live PLCs without authorization. "
+    "gx_paste_ladder is legacy: pasting IL text does nothing on GX Works2 1.620W."
 )
 server = create_server("gxworks2", _INSTRUCTIONS)
 _store: Store | None = None
@@ -81,6 +88,83 @@ def store() -> Store:
 
 
 # --- program authoring ------------------------------------------------------
+
+@server.tool()
+def gx_program_prepare(
+    name: str,
+    cpu: str,
+    il: str = "",
+    rungs: list[dict[str, Any]] | None = None,
+    overwrite: bool = False,
+    locale: str = "zh",
+    cpu_label: str = "",
+    preview: bool = False,
+) -> str:
+    """WRITE locally: batch author + validate + save + CSV export in one call.
+
+    Send either a complete IL string or ALL ladder rungs, not both. For FX SFC
+    use the existing STL/RET IL representation, not native graphical SFC blocks.
+    Validation errors block writes; warnings are returned. Existing projects
+    require overwrite=true. Responses stay compact unless preview=true. It
+    never opens GX Works2, imports a CSV, or connects to a PLC. Importing the
+    resulting CSV still requires explicit whole-program replacement approval.
+    """
+    if bool(il.strip()) == bool(rungs):
+        return json.dumps({"error": "pass exactly one non-empty il or rungs input"})
+    if not cpu.strip():
+        return json.dumps({"error": "cpu is required for validation and CSV labeling"})
+    if _cpu_limits(cpu) is None:
+        return json.dumps({"error": "unsupported CPU family; specify Q, L, FX3U or FX5U (or a supported model prefix)"})
+    if locale not in {"zh", "ja", "en"}:
+        return json.dumps({"error": "locale must be zh, ja or en"})
+    phase = "validation"
+    project_may_be_modified = False
+    try:
+        program = compile_rungs(rungs) if rungs else parse_il(il, title=name)
+        program.title = name
+        validation = summarize(validate_program(program, cpu=cpu))
+        if not validation["ok"]:
+            return json.dumps({"prepared": False, "validation": validation}, ensure_ascii=False)
+        workspace = store()
+        target = workspace.project_path(name)
+        existing = target.exists()
+        if existing:
+            if not overwrite:
+                return json.dumps({"error": "project already exists; pass overwrite=true to replace its program"})
+            project = workspace.get(name)
+            project.cpu = cpu
+        # Export first to a staging file. Export failures must not change an
+        # existing program and leave its old CSV looking like a new artifact.
+        with tempfile.TemporaryDirectory(prefix=".prepare-", dir=workspace.workspace) as staging:
+            phase = "csv_export"
+            staged_csv = write_program_csv(program, Path(staging) / "program.csv",
+                                           project_name=name, cpu_label=cpu_label or cpu, locale=locale)
+            phase = "project_save"
+            project_may_be_modified = True
+            if existing:
+                project.save(program)
+            else:
+                project = workspace.create(name, cpu=cpu, initial_program=program)
+            phase = "csv_publish"
+            csv_path = project.root / (name + ".csv")
+            os.replace(staged_csv, csv_path)
+    except (BuildError, ILParseError, DeviceError, StoreError, OSError) as exc:
+        return json.dumps({"prepared": False, "error": str(exc), "phase": phase,
+                           "projectMayBeModified": project_may_be_modified,
+                           "csvUpdated": False, "doNotImport": True,
+                           "hint": "retry preparation and inspect the project before importing; no valid new CSV returned"},
+                          ensure_ascii=False)
+    result: dict[str, Any] = {
+        "prepared": True, "project": name, "cpu": cpu,
+        "instructions": len(program), "devices": len(program.devices()),
+        "validation": validation, "csv": str(csv_path), "encoding": "utf-16-le",
+        "imported": False,
+    }
+    if preview:
+        result["il"] = render_il(program)
+        result["ascii"] = render_ascii(program)
+    return json.dumps(result, ensure_ascii=False)
+
 
 @server.tool()
 def gx_program_create(
@@ -855,3 +939,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
