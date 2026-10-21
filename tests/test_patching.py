@@ -226,3 +226,15 @@ def test_commit_rollback_failure_is_explicit(project, monkeypatch):
         apply_patch(project, view['version'], replace(view))
     assert error.value.rollback_complete is False
     assert project.read_il().startswith('LD X1')
+def test_temporary_project_locks_are_not_cached_forever(tmp_path):
+    import gc
+    from gxworks2_mcp import locking
+    from gxworks2_mcp.store import Project
+    gc.collect()
+    before = len(locking._locks)
+    for number in range(30):
+        with locking.project_lock(Project(str(number), tmp_path / str(number))):
+            pass
+    gc.collect()
+    assert len(locking._locks) <= before
+

@@ -37,6 +37,7 @@ import os
 import sys
 import tempfile
 import hashlib
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -55,7 +56,7 @@ from .blocks import ladder_blocks, render_ascii, to_boolean
 from .devices import DeviceError, describe as describe_device, expand_range, parse_range
 from .il import ILParseError, Program, instruction_count, parse_il, render_il
 from .mcprotocol import MCClient, MCConfig, MCProtocolError, probe as mc_probe
-from .store import Store, StoreError, device_usage, diff_programs
+from .store import Project, Store, StoreError, device_usage, diff_programs
 from .compat import SDK_GENERATION, create_server, run_server
 from .validate import _cpu_limits, summarize, validate_program
 from .verification import compare_programs
@@ -95,6 +96,19 @@ def store() -> Store:
 
 
 # --- program authoring ------------------------------------------------------
+
+@contextmanager
+def _temporary_workspace(prefix: str, directory: Path):
+    """Do not turn a completed write into a failure because staging cleanup failed."""
+    temporary = tempfile.TemporaryDirectory(prefix=prefix, dir=directory)
+    warnings: list[str] = []
+    try:
+        yield Path(temporary.name), warnings
+    finally:
+        try:
+            temporary.cleanup()
+        except OSError as exc:
+            warnings.append(str(exc))
 
 @server.tool()
 def gx_sfc_preview(table: dict[str, Any]) -> str:
@@ -150,27 +164,28 @@ def gx_program_prepare(
             return json.dumps({"prepared": False, "validation": validation}, ensure_ascii=False)
         workspace = store()
         target = workspace.project_path(name)
-        existing = target.exists()
-        if existing:
-            if not overwrite:
-                return json.dumps({"error": "project already exists; pass overwrite=true to replace its program"})
-            project = workspace.get(name)
-            project.cpu = cpu
-        # Export first to a staging file. Export failures must not change an
-        # existing program and leave its old CSV looking like a new artifact.
-        with tempfile.TemporaryDirectory(prefix=".prepare-", dir=workspace.workspace) as staging:
-            phase = "csv_export"
-            staged_csv = write_program_csv(program, Path(staging) / "program.csv",
-                                           project_name=name, cpu_label=cpu_label or cpu, locale=locale)
-            phase = "project_save"
-            project_may_be_modified = True
+        with project_lock(Project(name, target, cpu=cpu)):
+            existing = target.exists()
             if existing:
-                project.save(program)
-            else:
-                project = workspace.create(name, cpu=cpu, initial_program=program)
-            phase = "csv_publish"
-            csv_path = project.root / (name + ".csv")
-            os.replace(staged_csv, csv_path)
+                if not overwrite:
+                    return json.dumps({"error": "project already exists; pass overwrite=true to replace its program"})
+                project = workspace.get(name)
+                project.cpu = cpu
+            # Export first to a staging file. Export failures must not change an
+            # existing program and leave its old CSV looking like a new artifact.
+            with _temporary_workspace(".prepare-", workspace.workspace) as (staging, cleanup_warnings):
+                phase = "csv_export"
+                staged_csv = write_program_csv(program, Path(staging) / "program.csv",
+                                               project_name=name, cpu_label=cpu_label or cpu, locale=locale)
+                phase = "project_save"
+                project_may_be_modified = True
+                if existing:
+                    project.save(program)
+                else:
+                    project = workspace.create(name, cpu=cpu, initial_program=program)
+                phase = "csv_publish"
+                csv_path = project.root / (name + ".csv")
+                os.replace(staged_csv, csv_path)
     except (BuildError, ILParseError, DeviceError, StoreError, CSVFormatError, OSError) as exc:
         return json.dumps({"prepared": False, "error": str(exc), "phase": phase,
                            "projectMayBeModified": project_may_be_modified,
@@ -186,6 +201,8 @@ def gx_program_prepare(
     if preview:
         result["il"] = render_il(program)
         result["ascii"] = render_ascii(program)
+    if cleanup_warnings:
+        result["cleanupWarnings"] = cleanup_warnings
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -466,7 +483,7 @@ def gx_program_export_csv(
     name: str,
     path: str = "",
     locale: str = "zh",
-    cpu_label: str = "QCPU (Q mode) Q03UDV",
+    cpu_label: str = "",
 ) -> str:
     """Write the project as a GX Works2 program CSV (UTF-16 LE, tab, seven quoted columns).
 
@@ -479,18 +496,21 @@ def gx_program_export_csv(
         project = store().get(name)
     except StoreError as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)
-    program = project.read_program()
     target = path or str(project.root / (project.name + ".csv"))
     try:
-        written = write_program_csv(
-            program, target, project_name=project.name, cpu_label=cpu_label, locale=locale
-        )
+        with project_lock(project):
+            project = store().get(name)
+            program = project.read_program()
+            written = write_program_csv(
+                program, target, project_name=project.name, cpu_label=cpu_label or project.cpu, locale=locale
+            )
     except (OSError, CSVFormatError) as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)
     return json.dumps(
         {
             "written": str(written),
-            "rows": len(program) + 2,
+            "rows": 3 + sum(max(1, len(item.operands)) for item in program),
+            "instructions": len(program),
             "encoding": "utf-16-le",
             "locale": locale,
             "note": "this file matches the template GX Works2 imports via Edit > Read from "

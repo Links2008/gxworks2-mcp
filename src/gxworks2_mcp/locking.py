@@ -9,9 +9,10 @@ from contextlib import contextmanager
 import os
 import threading
 import time
+import weakref
 
 _guard = threading.Lock()
-_locks = {}
+_locks = weakref.WeakValueDictionary()
 _local = threading.local()
 
 

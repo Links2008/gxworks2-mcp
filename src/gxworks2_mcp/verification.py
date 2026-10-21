@@ -6,6 +6,7 @@ No GUI or device access occurs in this module.
 from __future__ import annotations
 
 from itertools import zip_longest
+import re
 
 from .il import Instruction, Program
 
@@ -13,7 +14,11 @@ from .il import Instruction, Program
 def _signature(item: Instruction, compare_comments: bool) -> tuple:
     # Do not guess CPU-specific radix/address aliases. Ignore only display steps,
     # whitespace already normalized by the parser, and identifier case.
-    values = (item.mnemonic.upper(), tuple(x.upper() for x in item.operands),
+    def operand_key(value: str) -> str:
+        # Quoted literals and unknown operand forms are data, not identifiers.
+        # In particular, $MOV "abc" must not compare equal to $MOV "ABC".
+        return value.upper() if re.fullmatch(r"(?:[A-Za-z]{1,3}\d+(?:\.\d+)?|[Kk]-?\d+|[Hh][0-9a-fA-F]+)", value) else value
+    values = (item.mnemonic.upper(), tuple(operand_key(x) for x in item.operands),
               (item.label or '').upper())
     return values + ((item.comment or '').strip(),) if compare_comments else values
 

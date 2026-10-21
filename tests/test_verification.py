@@ -92,3 +92,21 @@ def test_export_claim_without_file_is_not_success(stored, monkeypatch):
     monkeypatch.setattr(ui, 'export_program_csv', lambda *args, **kwargs: {'ok': True})
     result = json.loads(api.gx_verify_import('expected'))
     assert not result['verified'] and 'not produced' in result['error']
+
+
+def test_string_constants_are_compared_case_sensitively():
+    result = compare_programs(parse_il('$MOV "abc" D0\nEND'), parse_il('$MOV "ABC" D0\nEND'))
+    assert not result['matches'] and result['differenceCount'] == 1
+
+
+def test_live_readback_string_case_change_is_not_verified(stored, monkeypatch):
+    import gxworks2_mcp.server as api
+    from gxworks2_mcp import ui
+    from gxworks2_mcp.csvio import write_program_csv
+    stored.save(parse_il('$MOV "abc" D0\nEND'))
+    def export(path, **kwargs):
+        write_program_csv(parse_il('$MOV "ABC" D0\nEND'), path)
+        return {'ok': True}
+    monkeypatch.setattr(ui, 'export_program_csv', export)
+    result = json.loads(api.gx_verify_import('expected'))
+    assert not result['matches'] and not result['verified']

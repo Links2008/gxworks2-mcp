@@ -114,3 +114,64 @@ def test_csv_publish_failure_explicitly_reports_partial_state(workspace):
     assert not failed['prepared'] and failed['projectMayBeModified']
     assert failed['doNotImport'] and not failed['csvUpdated']
     assert failed['phase'] == 'csv_publish' and 'csv' not in failed
+
+
+def test_concurrent_prepare_cannot_publish_csv_from_an_older_program(workspace, monkeypatch):
+    from threading import Event, Thread
+    first_at_publish, release_first, second_started, second_done = (Event() for _ in range(4))
+    original_replace = api.os.replace
+    results = {}
+    def replace(source, target):
+        if not first_at_publish.is_set():
+            first_at_publish.set()
+            assert release_first.wait(5)
+        return original_replace(source, target)
+    monkeypatch.setattr(api.os, 'replace', replace)
+    def first():
+        results['first'] = json.loads(api.gx_program_prepare('race', 'FX3U', il='LD X1\nOUT Y1\nEND'))
+    def second():
+        second_started.set()
+        results['second'] = json.loads(api.gx_program_prepare('race', 'FX3U', il='LD X2\nOUT Y2\nEND', overwrite=True))
+        second_done.set()
+    a, b = Thread(target=first), Thread(target=second)
+    a.start()
+    assert first_at_publish.wait(5)
+    b.start()
+    assert second_started.wait(5)
+    try:
+        assert not second_done.wait(0.2), 'second writer must wait until first publishes CSV'
+    finally:
+        release_first.set()
+        a.join(5)
+        b.join(5)
+    assert not a.is_alive() and not b.is_alive()
+    assert results['first']['prepared'] and results['second']['prepared']
+    assert read_program_csv(results['second']['csv']).to_il() == workspace.get('race').read_il().strip()
+
+
+def test_export_csv_reports_physical_rows_and_preserves_cpu(workspace):
+    import csv
+    project = workspace.create('export', cpu='FX3U', initial_il='LD X1\nMOV K1 D1\nEND')
+    result = json.loads(api.gx_program_export_csv('export'))
+    with open(result['written'], encoding='utf-16') as handle:
+        rows = list(csv.reader(handle, delimiter='\t'))
+    assert result['rows'] == len(rows) == 7
+    assert result['instructions'] == 3
+    assert rows[1][1] == 'FX3U'
+
+
+def test_cleanup_failure_does_not_misreport_successful_prepare(workspace, monkeypatch):
+    factory = api.tempfile.TemporaryDirectory
+    def temporary(*args, **kwargs):
+        instance = factory(*args, **kwargs)
+        original = instance.cleanup
+        def cleanup():
+            original()
+            raise OSError('staging cleanup failed')
+        instance.cleanup = cleanup
+        return instance
+    monkeypatch.setattr(api.tempfile, 'TemporaryDirectory', temporary)
+    result = json.loads(api.gx_program_prepare('clean', 'FX3U', il='LD X1\nOUT Y1\nEND'))
+    assert result['prepared']
+    assert result['cleanupWarnings'] == ['staging cleanup failed']
+    assert read_program_csv(result['csv']).to_il() == workspace.get('clean').read_il().strip()

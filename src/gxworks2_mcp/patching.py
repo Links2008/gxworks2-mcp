@@ -177,7 +177,10 @@ new instructions receive new IDs. Non-instruction lines outside targets stay exa
         if not validation['ok']:
             raise PatchError('Full-program validation failed: ' + json.dumps(validation, ensure_ascii=False))
         # Derive metadata in isolation; never normalize or rewrite the original IL.
-        with tempfile.TemporaryDirectory(prefix='.patch-stage-', dir=project.root) as directory:
+        staging = tempfile.TemporaryDirectory(prefix='.patch-stage-', dir=project.root)
+        directory = staging.name
+        cleanup_warning = None
+        try:
             staged = Project(project.name, Path(directory) / 'staged', cpu=cpu)
             staged.save(program)
             merged = dict(metadata)
@@ -213,6 +216,17 @@ new instructions receive new IDs. Non-instruction lines outside targets stay exa
                     except OSError:
                         restored = False
                 raise PatchWriteError('Patch commit failed; verify files before retrying', rollback_complete=restored) from exc
-        return {'project': project.name, 'beforeVersion': version, 'version': new_version,
+        finally:
+            # Cleanup is not the commit. In particular, Windows may keep a
+            # staging file open after the program has already been committed.
+            # Never replace a transaction/rollback exception with cleanup noise.
+            try:
+                staging.cleanup()
+            except OSError as exc:
+                cleanup_warning = str(exc)
+        result = {'project': project.name, 'beforeVersion': version, 'version': new_version,
                 'granularity': 'instruction', 'changes': changes, 'validation': validation,
                 'instructionCount': len(program), 'cpu': cpu}
+        if cleanup_warning is not None:
+            result['cleanupWarning'] = cleanup_warning
+        return result
