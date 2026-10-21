@@ -53,7 +53,7 @@ ARITY: dict[str, int] = {
     "CALLP": 1,
     "STL": 1,
     "RET": 0,
-    "FOR": 2,
+    "FOR": 1,  # JY997D16601R §8.9 p241: FOR S (loop count), not two operands.
     "NEXT": 0,
     "EI": 0,
     "DI": 0,

@@ -35,6 +35,9 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
+import hashlib
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -53,21 +56,34 @@ from .blocks import ladder_blocks, render_ascii, to_boolean
 from .devices import DeviceError, describe as describe_device, expand_range, parse_range
 from .il import ILParseError, Program, instruction_count, parse_il, render_il
 from .mcprotocol import MCClient, MCConfig, MCProtocolError, probe as mc_probe
-from .store import Store, StoreError, device_usage, diff_programs
-from .sfc import compile_sfc, describe_sfc
+from .store import Project, Store, StoreError, device_usage, diff_programs
 from .compat import SDK_GENERATION, create_server, run_server
-from .validate import summarize, validate_program
+from .validate import _cpu_limits, summarize, validate_program
+from .verification import compare_programs
+from .locking import project_lock
+from .patching import PatchError, PatchWriteError, VersionConflict, apply_patch, read_patch_view
+from .sfc import SFCError, preview_sfc, compile_stl, describe_sfc
 
 DEFAULT_WORKSPACE = Path(os.environ.get("GXWORKS2_MCP_HOME", Path.home() / ".gxworks2-mcp"))
 
 _INSTRUCTIONS = (
-    "优先支持 FX3U：gx_program_create(cpu='FX3U', rungs=梯形图或sfc=步骤图) -> "
-    "gx_program_validate -> gx_write_project(confirm=true, path=新文件路径)。"
-    "直接写原生 GXW，不需要 GX Works2、computer use、鼠标、键盘或截图；自动核对源码和其他数据流。"
-    "SFC 以 FX3U STL/RET 步进程序保存，原生 SFC 图形布局另行支持。"
-    "gx_gxw_open 直接读取工程CPU和每个程序体；导入编辑时显式选择 program='MAIN.Program.pou'，"
-    "禁止把部分解码的内容当完整源码覆盖。生成文件仍需在 GX Works2 编译；实体 PLC 另行验证。"
-    "旧 CSV/UIA 工具保留为可选通路；不要自动调用 PLC 写入或远程控制工具。"
+    "FX3U 原生 SFC 使用 gx_sfc_write：一次提交完整 spec，原生编译、检查、保存和读回；"
+    "gx_sfc_read 离线读取图形步骤、动作和条件，不启动原生进程。"
+    "简单梯形图可用 gx_write_project 写出源码，仍需另行编译。"
+    "Author MELSEC ladder programs for GX Works2. Prefer gx_program_prepare: send ALL "
+    "rungs in one batch, or complete IL (including FX STL/RET sequences), to validate, "
+    "save locally and export CSV in ONE call with a compact response. Do not append "
+    "one rung per tool call. This does not automate the native graphical SFC editor. "
+    "Only when the user requests the optional CSV/UI bridge, gx_import_csv requires explicit replacement confirmation, followed by "
+    "gx_compile_csv, gx_verify_import for fresh content readback, and gx_save_project. "
+    "For local edits use gx_program_slice then gx_program_patch with the returned version. "
+    "gx_sfc_preview is structure-only and never emits runnable SFC. Legacy flow: "
+    "gx_program_create with rungs -> gx_program_validate -> gx_program_export_csv -> "
+    "gx_import_csv (confirm=true; drives GX Works2's Edit > Read from CSV file through UIA, "
+    "no mouse or foreground focus needed) -> gx_compile_csv -> gx_save_project. "
+    "The CSV import REPLACES the current ladder program. Offline validation does not "
+    "prove hardware safety. Do not connect to live PLCs without authorization. "
+    "gx_paste_ladder is legacy: pasting IL text does nothing on GX Works2 1.620W."
 )
 server = create_server("gxworks2", _INSTRUCTIONS)
 _store: Store | None = None
@@ -83,6 +99,157 @@ def store() -> Store:
 
 
 # --- program authoring ------------------------------------------------------
+
+@contextmanager
+def _temporary_workspace(prefix: str, directory: Path):
+    """Do not turn a completed write into a failure because staging cleanup failed."""
+    temporary = tempfile.TemporaryDirectory(prefix=prefix, dir=directory)
+    warnings: list[str] = []
+    try:
+        yield Path(temporary.name), warnings
+    finally:
+        try:
+            temporary.cleanup()
+        except OSError as exc:
+            warnings.append(str(exc))
+
+@server.tool()
+def gx_sfc_preview(table: dict[str, Any]) -> str:
+    """Validate a single-active-step FX3U state table and preview its structure.
+
+    This is NOT a runnable SFC/STL compiler. Returns runnable=false even when
+    structure is valid because scan-overlap, initialization and reset semantics
+    still need dedicated verification. No files, UI or PLC operations occur.
+    Table fields: cpu, initial, startup, reset, steps. Each step has id, state,
+    actions, and optionally transition={when: contact logic, to: step id}.
+    """
+    try:
+        return json.dumps(preview_sfc(table), ensure_ascii=False)
+    except SFCError as exc:
+        return json.dumps({"valid": False, "runnable": False, "error": str(exc)}, ensure_ascii=False)
+
+
+@server.tool()
+def gx_sfc_write(spec: dict[str, Any], path: str, template_path: str,
+                 installation_root: str = "", confirm: bool = False) -> str:
+    """写出并原生编译 FX3U SFC 图形工程，适配 GX Works2 1.620.0.1。
+
+    一次提交 initial、preamble 和 steps=[{state,actions,transitions:[{to,when}]}]。
+    支持顺序及双路选择分支；actions 为梯形图回路，可含定时器 preset。
+    模板须包含 Block 图形和 Block1 连续扫描块；仅另存新文件。
+    完成原生图形写入、完整程序检查、保存及磁盘读回才返回 ok=true。
+    不调用 computer use；最多一个原生子进程，用完退出；不连接 PLC。
+    installation_root 可省略以读取本机安装信息，或传包含 Easysocket 的根目录。
+    """
+    if not confirm:
+        return json.dumps({"ok": False, "error": "请传 confirm=true，另存原生 SFC 新工程"}, ensure_ascii=False)
+    from .native_sfc import write_sfc_gxw
+    try:
+        installation = installation_root or os.environ.get("GXWORKS2_INSTALL_ROOT", "")
+        if not installation:
+            from .ui import find_install
+            found = find_install()
+            if not found.get("found"):
+                raise GxwError("未找到 GX Works2，请指定 installation_root")
+            installation = str(Path(found["executable"]).parent.parent)
+        return json.dumps(write_sfc_gxw(template_path, path, spec, installation), ensure_ascii=False)
+    except (BuildError, GxwError, OSError, ValueError, TypeError, TimeoutError) as exc:
+        return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+
+@server.tool()
+def gx_sfc_read(path: str) -> str:
+    """离线读取 FX3U 原生 SFC 步骤、动作和条件；无进程、无 UI、无 PLC 通信。
+
+    返回每个程序块的步骤引用、S 状态号、动作指令和条件跳转关系。
+    未知图形指令或不完整的动作注册均返回错误，不拼凑可编辑的完整程序。
+    """
+    from .native_sfc import read_sfc_gxw
+    try:
+        return json.dumps(read_sfc_gxw(path), ensure_ascii=False)
+    except (GxwError, OSError, ValueError) as exc:
+        return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+
+@server.tool()
+def gx_program_prepare(
+    name: str,
+    cpu: str,
+    il: str = "",
+    rungs: list[dict[str, Any]] | None = None,
+    overwrite: bool = False,
+    locale: str = "zh",
+    cpu_label: str = "",
+    preview: bool = False,
+) -> str:
+    """WRITE locally: batch author + validate + save + CSV export in one call.
+
+    Send either a complete IL string or ALL ladder rungs, not both. For FX SFC
+    use the existing STL/RET IL representation, not native graphical SFC blocks.
+    Validation errors block writes; warnings are returned. Existing projects
+    require overwrite=true. Responses stay compact unless preview=true. It
+    never opens GX Works2, imports a CSV, or connects to a PLC. Importing the
+    resulting CSV still requires explicit whole-program replacement approval.
+    """
+    if bool(il.strip()) == bool(rungs):
+        return json.dumps({"error": "pass exactly one non-empty il or rungs input"})
+    if not cpu.strip():
+        return json.dumps({"error": "cpu is required for validation and CSV labeling"})
+    if _cpu_limits(cpu) is None:
+        return json.dumps({"error": "unsupported CPU family; specify Q, L, FX3U or FX5U (or a supported model prefix)"})
+    if locale not in {"zh", "ja", "en"}:
+        return json.dumps({"error": "locale must be zh, ja or en"})
+    phase = "validation"
+    project_may_be_modified = False
+    try:
+        program = compile_rungs(rungs) if rungs else parse_il(il, title=name)
+        program.title = name
+        validation = summarize(validate_program(program, cpu=cpu))
+        if not validation["ok"]:
+            return json.dumps({"prepared": False, "validation": validation}, ensure_ascii=False)
+        workspace = store()
+        target = workspace.project_path(name)
+        with project_lock(Project(name, target, cpu=cpu)):
+            existing = target.exists()
+            if existing:
+                if not overwrite:
+                    return json.dumps({"error": "project already exists; pass overwrite=true to replace its program"})
+                project = workspace.get(name)
+                project.cpu = cpu
+            # Export first to a staging file. Export failures must not change an
+            # existing program and leave its old CSV looking like a new artifact.
+            with _temporary_workspace(".prepare-", workspace.workspace) as (staging, cleanup_warnings):
+                phase = "csv_export"
+                staged_csv = write_program_csv(program, Path(staging) / "program.csv",
+                                               project_name=name, cpu_label=cpu_label or cpu, locale=locale)
+                phase = "project_save"
+                project_may_be_modified = True
+                if existing:
+                    project.save(program)
+                else:
+                    project = workspace.create(name, cpu=cpu, initial_program=program)
+                phase = "csv_publish"
+                csv_path = project.root / (name + ".csv")
+                os.replace(staged_csv, csv_path)
+    except (BuildError, ILParseError, DeviceError, StoreError, CSVFormatError, OSError) as exc:
+        return json.dumps({"prepared": False, "error": str(exc), "phase": phase,
+                           "projectMayBeModified": project_may_be_modified,
+                           "csvUpdated": False, "doNotImport": True,
+                           "hint": "retry preparation and inspect the project before importing; no valid new CSV returned"},
+                          ensure_ascii=False)
+    result: dict[str, Any] = {
+        "prepared": True, "project": name, "cpu": cpu,
+        "instructions": len(program), "devices": len(program.devices()),
+        "validation": validation, "csv": str(csv_path), "encoding": "utf-16-le",
+        "imported": False,
+    }
+    if preview:
+        result["il"] = render_il(program)
+        result["ascii"] = render_ascii(program)
+    if cleanup_warnings:
+        result["cleanupWarnings"] = cleanup_warnings
+    return json.dumps(result, ensure_ascii=False)
+
 
 @server.tool()
 def gx_program_create(
@@ -109,7 +276,7 @@ def gx_program_create(
         if sum((bool(rungs), bool(il), sfc is not None)) > 1:
             raise BuildError("il、rungs、sfc 只能选择一种输入")
         if sfc is not None:
-            program = compile_sfc(sfc, cpu)
+            program = compile_stl(sfc, cpu)
             validation = summarize(validate_program(program, cpu=cpu))
             if not validation["ok"]:
                 return json.dumps({"error": "SFC 校验失败", "validation": validation}, ensure_ascii=False)
@@ -214,6 +381,59 @@ def gx_program_replace(name: str, il: str) -> str:
         ensure_ascii=False,
         indent=2,
     )
+
+
+@server.tool()
+def gx_program_slice(name: str, start: int = 0, limit: int = 50) -> str:
+    """Read a bounded instruction slice with stable IDs and a version for local patching.
+
+    IDs refer to instructions, NOT inferred rung boundaries. Follow nextStart for
+    more context. External rewrites invalidate IDs; fetch a fresh slice on conflict.
+    """
+    try:
+        return json.dumps(read_patch_view(store().get(name), start=start, limit=limit), ensure_ascii=False)
+    except (StoreError, PatchError, OSError, ValueError) as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+
+@server.tool()
+def gx_program_patch(name: str, expected_version: str, operations: list[dict[str, Any]],
+                     export_csv: bool = True, locale: str = "zh") -> str:
+    """WRITE local instruction edits by stable ID, with mandatory version check.
+
+    Each operation has op (insert_before/insert_after/replace/delete), target_id,
+    and il (except delete). Read gx_program_slice first. The entire resulting
+    program is validated. By default refreshes CSV within the same call; never
+    imports it or accesses a PLC. Use versioned patches for cooperative editing;
+    old whole-program tools have no stale-version protection. Process crashes
+    are not a multi-file transaction; inspect any reported partial-write error.
+    """
+    if locale not in {"zh", "ja", "en"}:
+        return json.dumps({"applied": False, "error": "locale must be zh, ja or en"})
+    try:
+        project = store().get(name)
+        with project_lock(project):
+            result = apply_patch(project, expected_version, operations)
+            result.update({"applied": True, "imported": False, "csvUpdated": False})
+            if export_csv:
+                try:
+                    fresh = store().get(name)
+                    path = write_program_csv(fresh.read_program(), fresh.root / (name + ".csv"),
+                                             project_name=name, cpu_label=fresh.cpu, locale=locale)
+                    result.update({"csvUpdated": True, "csv": str(path)})
+                except (OSError, CSVFormatError, ILParseError) as exc:
+                    result.update({"csvError": str(exc), "doNotImport": True})
+            else:
+                result["doNotImport"] = True
+            return json.dumps(result, ensure_ascii=False)
+    except VersionConflict as exc:
+        return json.dumps({"applied": False, "conflict": True, "error": str(exc),
+                           "hint": "read a fresh slice and reconsider the patch; do not blindly retry"})
+    except PatchWriteError as exc:
+        return json.dumps({"applied": False, "error": str(exc), "rollbackComplete": exc.rollback_complete,
+                           "doNotImport": True})
+    except (StoreError, PatchError, OSError, ValueError) as exc:
+        return json.dumps({"applied": False, "error": str(exc)}, ensure_ascii=False)
 
 
 @server.tool()
@@ -342,7 +562,7 @@ def gx_program_export_csv(
     name: str,
     path: str = "",
     locale: str = "zh",
-    cpu_label: str = "QCPU (Q mode) Q03UDV",
+    cpu_label: str = "",
 ) -> str:
     """Write the project as a GX Works2 program CSV (UTF-16 LE, tab, seven quoted columns).
 
@@ -355,18 +575,21 @@ def gx_program_export_csv(
         project = store().get(name)
     except StoreError as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)
-    program = project.read_program()
     target = path or str(project.root / (project.name + ".csv"))
     try:
-        written = write_program_csv(
-            program, target, project_name=project.name, cpu_label=cpu_label, locale=locale
-        )
-    except OSError as exc:
+        with project_lock(project):
+            project = store().get(name)
+            program = project.read_program()
+            written = write_program_csv(
+                program, target, project_name=project.name, cpu_label=cpu_label or project.cpu, locale=locale
+            )
+    except (OSError, CSVFormatError) as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)
     return json.dumps(
         {
             "written": str(written),
-            "rows": len(program) + 2,
+            "rows": 3 + sum(max(1, len(item.operands)) for item in program),
+            "instructions": len(program),
             "encoding": "utf-16-le",
             "locale": locale,
             "note": "this file matches the template GX Works2 imports via Edit > Read from "
@@ -662,7 +885,7 @@ def gx_import_csv(
         target = str(store_project.root / (store_project.name + ".import.csv"))
         try:
             write_program_csv(program, target, project_name=store_project.name)
-        except OSError as exc:
+        except (OSError, CSVFormatError) as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
     if not target:
         return json.dumps({"error": "pass csv_path or project"}, ensure_ascii=False)
@@ -671,6 +894,58 @@ def gx_import_csv(
     except ui.AutomationError as exc:
         return json.dumps({"error": str(exc), "csv": target}, ensure_ascii=False)
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@server.tool()
+def gx_verify_import(
+    name: str,
+    readback_path: str = "",
+    title_hint: str = "",
+    compare_comments: bool = True,
+) -> str:
+    """Compare stored instructions with a separate GX Works2 CSV readback.
+
+    With readback_path, compares that file only and does NOT claim a live import
+    was verified. Without it, exports the currently open GX Works2 program to a
+    unique temporary CSV using the existing Windows UI bridge, then compares.
+    Never imports, compiles, saves a GXW, or connects to PLC hardware. Matching
+    content is not evidence of runtime safety or successful compilation.
+    """
+    try:
+        project = store().get(name)
+        before = project.il_path.read_bytes()
+        expected = parse_il(before.decode("utf-8"), title=name)
+        version = hashlib.sha256(before).hexdigest()
+
+        def verify(path: str, live: bool) -> dict[str, Any]:
+            actual = read_program_csv(path).to_program(title=name)
+            if project.il_path.read_bytes() != before:
+                return {"verified": False, "error": "expected project changed during readback; retry",
+                        "expectedVersion": version, "liveReadback": live}
+            comparison = compare_programs(expected, actual, compare_comments=compare_comments)
+            return {"verified": live and comparison["matches"], "liveReadback": live,
+                    "source": "gxworks2_export" if live else "provided_csv",
+                    "expectedVersion": version, **comparison,
+                    "compiled": False, "hardwareValidated": False,
+                    "note": "content comparison only; provided CSV provenance/freshness is not established" if not live
+                    else "fresh UI export compared; compilation and runtime validation remain separate"}
+
+        if readback_path:
+            result = verify(readback_path, False)
+        else:
+            from . import ui
+            with tempfile.TemporaryDirectory(prefix="gx-readback-") as directory:
+                path = str(Path(directory) / "readback.csv")
+                try:
+                    report = ui.export_program_csv(path, title_hint=title_hint or None)
+                except ui.AutomationError as exc:
+                    return json.dumps({"verified": False, "error": str(exc), "liveReadback": False})
+                if not report.get("ok") or not Path(path).is_file():
+                    return json.dumps({"verified": False, "error": "fresh GX Works2 export was not produced"})
+                result = verify(path, True)
+        return json.dumps(result, ensure_ascii=False)
+    except (StoreError, CSVFormatError, ILParseError, DeviceError, OSError, UnicodeError) as exc:
+        return json.dumps({"verified": False, "error": str(exc)}, ensure_ascii=False)
 
 
 @server.tool()

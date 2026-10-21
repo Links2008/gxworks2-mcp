@@ -3,7 +3,7 @@
 import pytest
 
 from examples.fx3u_sequence import ladder_program, sequence_spec
-from gxworks2_mcp.sfc import compile_sfc
+from gxworks2_mcp.sfc import compile_stl
 from gxworks2_mcp.validate import summarize, validate_program
 
 
@@ -139,12 +139,12 @@ def test_stop_wins_over_start_and_early_restart_is_ignored():
 
 
 def test_both_program_forms_validate_for_fx3u():
-    for program in (ladder_program(), compile_sfc(sequence_spec(), "FX3U")):
+    for program in (ladder_program(), compile_stl(sequence_spec(), "FX3U")):
         assert summarize(validate_program(program, cpu="FX3U"))["ok"]
 
 
 def test_sfc_and_ladder_follow_the_same_output_sequence():
-    programs = (ladder_program(), compile_sfc(sequence_spec(), "FX3U"))
+    programs = (ladder_program(), compile_stl(sequence_spec(), "FX3U"))
     events = []
     for program in programs:
         plc = Scan(program)

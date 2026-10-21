@@ -31,7 +31,11 @@ def encode_program(program: Program, cpu: str = "FX3U", text_encoding: str = "ut
                    if name == ins.mnemonic and arity == len(ins.operands)]
         if not choices:
             raise GxwError("没有已验证的编码：" + str(ins))
-        output.extend(min(choices, key=lambda item: len(item[0]))[0])
+        if ins.mnemonic in {"SET", "RST"} and ins.operands[0].upper().startswith("S"):
+            # 本机原生程序检查要求 S 步骤使用专用置位、复位编码。
+            output.extend(bytes.fromhex("04230204" if ins.mnemonic == "SET" else "04240204"))
+        else:
+            output.extend(min(choices, key=lambda item: len(item[0]))[0])
         for text in ins.operands:
             if re.fullmatch(r"K[+-]?\d+", text, re.I):
                 value = int(text[1:])

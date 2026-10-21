@@ -60,13 +60,46 @@ py examples/fx3u_sequence.py E:\工程序列\顺启逆停
    （语法经「写入→保存→读回」闭环逐字节对撞验证，见 re-evidence/GRAMMAR.md；
    未知构造一律停止并报 stopReason，绝不编造指令）；
    简单梯形图源码和部分网络记录可解码；任何不完整网络均返回 stopReason 和 partialIl，
-   不会被物化成可覆盖原工程的完整源码。原生 SFC 图形布局仍需继续解析。
+   不会被物化成可覆盖原工程的完整源码。FX3U 原生 SFC 图形使用 `gx_sfc_read` 完整读取。
 2. **MC 协议路线（连 PLC）**：QnA 兼容 3E 帧，字节序/设备码/位打包已与参考实现逐字节比对，
    并已按三菱官方手册 SH-080008 校验。直接读写软元件、远程 RUN/STOP/PAUSE/latch clear。
 
 第 1 条**不依赖 GX Works2 是否安装**；第 2 条只需要 PLC 的网络端口。
 
 ## SFC（顺控程序）支持
+
+### 原生 SFC 图形：本机 1.620 已验证
+
+`gx_sfc_write` 一次完成图形创建、步骤动作和条件注册、原生整工程转换、完整程序检查、
+保存导出，以及磁盘读回。使用安装的 GX Works2 1.620.0.1 原生接口和 FX 14.67 转换器，
+不启动 GD2，不调用 computer use、鼠标、键盘、截图或 UI Automation。
+同一时间最多一个按需 x86 辅助进程，完成或失败后退出；不连接 PLC。
+
+```python
+from examples.fx3u_sequence import native_sequence_spec
+
+gx_sfc_write(
+    spec=native_sequence_spec(),
+    path=r"E:\工程序列\顺启逆停_原生SFC.gxw",
+    template_path=r"E:\工程序列\FX3U_SFC模板.gxw",
+    installation_root=r"D:\新建文件夹",
+    confirm=True,
+)
+gx_sfc_read(path=r"E:\工程序列\顺启逆停_原生SFC.gxw")
+```
+
+模板目前须为 `Block.Program.pou` 图形、`Block1.Program.pou` 连续扫描块及 `MAIN.res`
+组成的 FX3U/FX3UC 工程。`spec` 使用 `initial/preamble/steps`，步骤包含
+`state/actions/transitions`。支持顺序、双路选择和显式跳转；暂不支持并行分支及任意模板布局。
+输出须为新文件；未知原生版本、未知数据流变化、编译错误或读回差异均阻止发布。
+安装目录可省略，由本机注册信息或 `GXWORKS2_INSTALL_ROOT` 取得。
+
+该示例为 6 步、8 转移、1 秒间隔。输出集中驱动，避免重复线圈；首次扫描清理旧步骤，
+同时按启停不产生延迟启动，持续按住启动不自动重启。完整编译检查实测约 6.6 秒；
+纯文件 `gx_sfc_read` 约 12 毫秒，不启动任何辅助进程。每次写入返回独立阶段耗时和原生诊断。
+原生编译及读回通过与实体 PLC 验证是不同的验收层；本项目没有自动下载或驱动实体设备。
+
+### 指令表与结构预览
 
 GX Works2 的 FX 系列顺控程序在指令表里就是 **STL 步进梯形**（`STL S0 … RET`），
 本服务器全链路支持：
@@ -78,9 +111,33 @@ GX Works2 的 FX 系列顺控程序在指令表里就是 **STL 步进梯形**（
 - 从 .gxw 解码回来的顺控程序、以及新建的顺控程序，都能用
   gx_where_used / gx_trace_device（转移条件追踪）/ gx_lint_program 分析
 
-SFC 语言编辑器（图形块）的原生 .pou 记录格式仍在逆向边界内，见 re-evidence/GRAMMAR.md。
+`gx_sfc_preview` 保留远端已有的只读结构预览，始终返回 `runnable=false`，其表结构与
+原生写入的 `spec` 不同。指令表源码导出的文件仍需编译；原生图形闭环见
+`docs/原生SFC_1620验证.md`，记录格式见 `re-evidence/GRAMMAR.md`。
 
 ## 安装
+
+### AI 批量写入的快速路径
+
+优先调用 `gx_program_prepare(name, cpu, rungs=[...])`，一次传入全部梯级；
+或用 `il="..."` 传完整指令表。FX 顺控使用已有的 `STL ... RET ... END`
+表示，不等同于 GX Works2 原生图形 SFC 编辑器。
+
+这一个调用完成生成、静态校验、保存及 CSV 导出，默认只返回摘要、全部校验消息和
+CSV 路径，不重复回显整个 IL/ASCII。需要预览时传 `preview=true`，或之后调用
+`gx_program_read`。校验错误会阻止写入；替换现有本地工程需 `overwrite=true`。
+`cpu` 必填，CSV 使用该 CPU 标签；需要精确机型描述时传 `cpu_label`。
+
+不要逐条调用 `gx_program_add_rungs`，也不要为每次调用重新启动 MCP 服务。
+保持同一个 stdio 会话。批量准备不会操作桌面或 PLC；CSV 导入仍单独调用
+`gx_import_csv(confirm=true)`，并在导入后编译、检查。详情与可重复基准见
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md)。
+
+增量修改用 `gx_program_slice` 读取稳定指令 ID 与版本，再用 `gx_program_patch`
+批量修改并刷新 CSV；旧版本拒绝写入。`gx_sfc_preview` 提供步骤表结构检查，
+但始终返回 `runnable=false`，尚不是 SFC 编译器。导入后可调用
+`gx_verify_import` 通过新导出 CSV 核对内容；仅提供一个 CSV 文件时只做离线比较，
+不会冒称实机导入验证。详见 [docs/EDIT_AND_VERIFY.md](docs/EDIT_AND_VERIFY.md)。
 
 需要 Python 3.10+。
 

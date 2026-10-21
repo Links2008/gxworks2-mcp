@@ -28,7 +28,7 @@ license-files = ["LICENSE", "third-party/*.txt", "third-party/README.md"]
 where = ["src"]
 
 [tool.setuptools.package-data]
-gxworks2_mcp = ["data/*.json", "data/*.gxw"]
+gxworks2_mcp = ["data/*.json", "data/*.gxw", "data/*.cs"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

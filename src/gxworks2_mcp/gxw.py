@@ -598,8 +598,10 @@ def _pou_records(payload):
             and m3 == 12
             and payload[i + 20 : i + 24] == marker_zero
             and payload[i + 24 : i + 28] == marker_ff
-            and 0 < size <= n - i - 28
+            and size > 0
         ):
+            # Keep recognized truncated records visible to the decoder. Silently
+            # scanning past them could turn a damaged program into a success.
             yield (i, size, payload[i + 28 : i + 28 + size])
             i += 28 + size
         else:
@@ -639,7 +641,7 @@ def pou_stream(payload, cpu="", text_encoding="utf-8"):
     Anything outside the proven operator table is counted, never guessed.
     """
 
-    from .il import Instruction, Program, render_il
+    from .il import ILParseError, Instruction, Program, parse_il, render_il
 
     native_sfc = len(payload) >= 58 and struct.unpack_from("<I", payload, 54)[0] == 240
     if len(payload) >= 103 and payload[54] == 1:
@@ -656,55 +658,88 @@ def pou_stream(payload, cpu="", text_encoding="utf-8"):
     program = Program()
     networks = 0
     skipped = 0
-    incomplete = []
-    token_bytes = 0
-    consumed_bytes = 0
+    failures = []
+    records = 0
+    partial_lines = []
 
-    for _off, _size, body in _pou_records(payload):
+    for index, (offset, size, body) in enumerate(_pou_records(payload)):
+        records += 1
+        if len(body) != size:
+            failures.append({
+                "networkIndex": index, "recordOffset": offset,
+                "stopReason": "network record payload truncated",
+                "declaredBytes": size, "availableBytes": len(body),
+            })
+            continue
         tokens = _strip_network_trailer(body)
         if not tokens:
+            # Only a recognized metadata-only record may be skipped. Unknown
+            # non-empty records are failures, not harmless metadata.
             skipped += 1
             continue
         attempt = main_res_program(struct.pack("<I", len(tokens)) + tokens, body_len_offset=0, cpu=cpu, text_encoding=text_encoding)
-        token_bytes += len(tokens)
-        consumed_bytes += attempt.get("consumedBytes", 0)
-        if not attempt.get("decoded") and not (
+        # A structured network need not carry END. This is the sole recoverable
+        # MAIN.res failure: the whole token run must have decoded, without an
+        # unknown operator, unreadable operand, or truncated record.
+        complete = attempt.get("decoded") or (
             attempt.get("stopReason") == "stream ended without END/FEND"
             and attempt.get("consumedBytes") == len(tokens)
-        ):
-            incomplete.append({"offset": _off, "reason": attempt.get("stopReason", attempt.get("error", "未知记录"))})
-        text = attempt.get("il") if attempt.get("decoded") else attempt.get("partialIl")
-        if not text or not text.strip():
-            skipped += 1
+        )
+        text = attempt.get("il") if attempt.get("decoded") else attempt.get("partialIl", "")
+        if not complete:
+            failures.append({
+                "networkIndex": index, "recordOffset": offset,
+                "stopReason": attempt.get("stopReason", attempt.get("error", "network not decoded")),
+                "consumedBytes": attempt.get("consumedBytes", 0),
+                "tokenBytes": len(tokens), "partialIl": text,
+            })
+            if not failures[:-1] and text:
+                partial_lines.extend(text.splitlines())
+            continue
+        try:
+            decoded = parse_il(text)
+        except ILParseError as exc:
+            failures.append({
+                "networkIndex": index, "recordOffset": offset,
+                "stopReason": "decoded IL could not be parsed: " + str(exc),
+                "partialIl": text,
+            })
             continue
         networks += 1
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line == "END":
-                continue
-            mnemonic, _, operands = line.partition(" ")
-            operands, _, comment = operands.partition("  // ")
-            ins = Instruction(mnemonic, operands.split() if operands.strip() else [])
-            if comment:
-                ins.comment = comment.strip()
-            program.append(ins)
+        instructions = [ins for ins in decoded.instructions if ins.mnemonic != "END"]
+        program.extend(instructions)
+        if not failures:
+            partial_lines.extend(render_il(Program(instructions)).splitlines())
+
+    if failures:
+        # Never expose an editable IL or synthesize END across unknown data.
+        # partialIl is only the contiguous prefix before the first failure.
+        return {
+            "decoded": False,
+            "coverage": min(0.999, round(networks / max(1, networks + len(failures)), 3)),
+            "framing": "network-records",
+            "networks": networks, "skippedNetworks": skipped,
+            "failedNetworks": failures,
+            "stopReason": "network " + str(failures[0]["networkIndex"])
+                + " at " + hex(failures[0]["recordOffset"]) + ": " + failures[0]["stopReason"],
+            "partialIl": "\n".join(partial_lines),
+        }
 
     if not program.instructions:
-        # last resort: a continuous stream ending in END (simple projects)
-        first = payload.find(bytes.fromhex("030003"))
-        if first >= 0 and not incomplete and not native_sfc:
-            end = payload.find(bytes.fromhex("04340204"), first)
-            if end > first:
-                stream = payload[first : end + 4]
-                attempt = main_res_program(struct.pack("<I", len(stream)) + stream, body_len_offset=0, cpu=cpu, text_encoding=text_encoding)
-                if attempt.get("decoded"):
-                    return {
-                        "decoded": True,
-                        "coverage": 1.0,
-                        "framing": "continuous-token-stream",
-                        "il": attempt["il"],
-                        "devices": attempt["devices"],
-                    }
+        # A recognized record must not be bypassed by finding a convenient
+        # continuous token fragment inside it.
+        if not records:
+            # Decode the entire body, never a convenient LD...END fragment
+            # hidden inside unknown framing or followed by unparsed data.
+            attempt = main_res_program(struct.pack("<I", len(payload)) + payload, body_len_offset=0, cpu=cpu, text_encoding=text_encoding)
+            if attempt.get("decoded") and attempt.get("consumedBytes") == len(payload):
+                return {
+                    "decoded": True,
+                    "coverage": 1.0,
+                    "framing": "continuous-token-stream",
+                    "il": attempt["il"],
+                    "devices": attempt["devices"],
+                }
         return {
             "decoded": False,
             "coverage": 0.0,
@@ -712,14 +747,14 @@ def pou_stream(payload, cpu="", text_encoding="utf-8"):
         }
 
     program.append(Instruction("END"))
-    if incomplete or native_sfc:
+    if native_sfc:
         return {
             "decoded": False,
-            "coverage": round(consumed_bytes / max(1, token_bytes), 3),
+            "coverage": 0.0,
             "framing": "network-records",
             "partialIl": render_il(program),
-            "stopReason": "原生 SFC 图形及步骤绑定尚未完整解码，仅返回子网络指令" if native_sfc else "存在未完整解码的网络，禁止作为完整程序写回",
-            "incompleteNetworks": incomplete,
+            "stopReason": "请用 gx_sfc_read 完整读取原生 SFC 图形及步骤绑定；此处仅预览子网络" if native_sfc else "存在未完整解码的网络，禁止作为完整程序写回",
+            "incompleteNetworks": [],
         }
     return {
         "decoded": True,
@@ -730,4 +765,3 @@ def pou_stream(payload, cpu="", text_encoding="utf-8"):
         "il": render_il(program),
         "devices": program.devices(),
     }
-

@@ -24,6 +24,7 @@ import csv
 import io
 import json
 import re
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +34,7 @@ from .blocks import ladder_blocks, render_ascii, to_boolean
 from .devices import DeviceError, parse_device
 from .il import Program, instruction_count, parse_il, render_il
 from .validate import summarize, validate_program
+from .locking import project_lock
 
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -90,6 +92,11 @@ class Project:
     def save(self, program: Program, *, comments: dict[str, str] | None = None) -> dict[str, object]:
         """Persist IL, structured JSON and device comments; return a write report."""
 
+        with project_lock(self):
+            return self._save_unlocked(program, comments=comments)
+
+    def _save_unlocked(self, program: Program, *, comments: dict[str, str] | None = None) -> dict[str, object]:
+
         self.root.mkdir(parents=True, exist_ok=True)
         il_text = render_il(program)
         self.il_path.write_text(il_text + "\n", encoding="utf-8")
@@ -143,12 +150,17 @@ class Store:
             )
         return self.projects_dir / name
 
-    def create(self, name: str, *, cpu: str = "Q", title: str = "", initial_il: str = "") -> Project:
+    def create(self, name: str, *, cpu: str = "Q", title: str = "", initial_il: str = "",
+               initial_program: Program | None = None) -> Project:
+        if initial_program is not None and initial_il:
+            raise StoreError("pass either initial_program or initial_il, not both")
+        program = initial_program if initial_program is not None else (
+            parse_il(initial_il, title=title or name) if initial_il else Program(title=title or name)
+        )
         project = Project(name=name, root=self.project_path(name), cpu=cpu)
         if project.exists():
             raise StoreError("project " + repr(name) + " already exists at " + str(project.root))
         project.root.mkdir(parents=True, exist_ok=False)
-        program = parse_il(initial_il, title=title or name) if initial_il else Program(title=title or name)
         project.save(program)
         return project
 
@@ -157,9 +169,20 @@ class Store:
         if not project.exists():
             raise StoreError("project " + repr(name) + " does not exist under " + str(self.projects_dir))
         try:
-            project.cpu = json.loads(project.json_path.read_text(encoding="utf-8")).get("cpu", "Q")
-        except (OSError, ValueError, AttributeError) as exc:
-            raise StoreError("工程元数据无法读取：" + str(exc)) from exc
+            metadata = json.loads(project.json_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            # Legacy IL-only workspaces did not persist a CPU selection.
+            return project
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise StoreError(f"cannot read metadata for project {name!r}: {exc}") from exc
+        if not isinstance(metadata, dict):
+            raise StoreError(f"invalid metadata for project {name!r}: expected an object")
+        cpu = metadata.get("cpu", "Q")
+        # GXW imports deliberately use an empty CPU for an unidentified family.
+        # Preserve that state rather than silently selecting Q-specific limits.
+        if not isinstance(cpu, str) or (cpu and not cpu.strip()):
+            raise StoreError(f"invalid CPU metadata for project {name!r}: expected a CPU string")
+        project.cpu = cpu
         return project
 
     def list(self) -> list[dict[str, object]]:
@@ -184,23 +207,56 @@ class Store:
 
     def delete(self, name: str) -> None:
         project = self.get(name)
-        for child in sorted(project.root.rglob("*"), reverse=True):
-            child.unlink() if child.is_file() else child.rmdir()
-        project.root.rmdir()
+        with project_lock(project):
+            for child in sorted(project.root.rglob("*"), reverse=True):
+                child.unlink() if child.is_file() else child.rmdir()
+            project.root.rmdir()
 
 
 def diff_programs(before: Program, after: Program) -> dict[str, object]:
-    """Line-level diff between two programs, for review before writing to a project."""
+    """Order-sensitive instruction diff; comments and display steps are excluded.
 
-    left = [str(instruction) for instruction in before.instructions]
-    right = [str(instruction) for instruction in after.instructions]
-    removed = [line for line in left if line not in right]
-    added = [line for line in right if line not in left]
+    Labels are included because changing a jump target changes program behavior.
+    Change ranges are zero-based, half-open instruction indexes.
+    """
+
+    def lines(program: Program) -> list[str]:
+        return [(f"{item.label}: " if item.label else "") + str(item)
+                for item in program.instructions]
+
+    left, right = lines(before), lines(after)
+    if left == right:
+        return {"added": [], "removed": [], "before": len(left), "after": len(right), "changes": []}
+    # Repeated instructions make SequenceMatcher quadratic even for a tiny edit.
+    # Keep equal boundaries out of the matcher without dropping duplicate lines.
+    # Ambiguous repeats are anchored to these boundaries; ranges remain global.
+    start = 0
+    common_length = min(len(left), len(right))
+    while start < common_length and left[start] == right[start]:
+        start += 1
+    left_end, right_end = len(left), len(right)
+    while left_end > start and right_end > start and left[left_end - 1] == right[right_end - 1]:
+        left_end -= 1
+        right_end -= 1
+    removed: list[str] = []
+    added: list[str] = []
+    changes: list[dict[str, object]] = []
+    for operation, i1, i2, j1, j2 in SequenceMatcher(
+        None, left[start:left_end], right[start:right_end], autojunk=False
+    ).get_opcodes():
+        if operation == "equal":
+            continue
+        i1, i2, j1, j2 = i1 + start, i2 + start, j1 + start, j2 + start
+        removed.extend(left[i1:i2])
+        added.extend(right[j1:j2])
+        changes.append({"operation": operation, "beforeRange": [i1, i2],
+                        "afterRange": [j1, j2], "removed": left[i1:i2], "added": right[j1:j2]})
     return {
         "added": added,
         "removed": removed,
         "before": len(left),
         "after": len(right),
+        "changes": changes,
     }
 
 

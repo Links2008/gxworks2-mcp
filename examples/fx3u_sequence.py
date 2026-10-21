@@ -5,7 +5,7 @@ from pathlib import Path
 
 from gxworks2_mcp.author import compile_logic
 from gxworks2_mcp.il import parse_il, render_il
-from gxworks2_mcp.sfc import compile_sfc
+from gxworks2_mcp.sfc import compile_stl
 from gxworks2_mcp.native import write_gxw
 
 
@@ -61,12 +61,28 @@ def ladder_program():
     return parse_il("\n".join(lines + ["END"]))
 
 
+def native_sequence_spec():
+    """原生 SFC 严格检查版：各输出集中驱动，步骤动作只保留定时器。"""
+    spec = sequence_spec()
+    outputs = {}
+    for step in spec["steps"]:
+        for action in step["actions"]:
+            if action["out"].startswith("Y"):
+                outputs.setdefault(action["out"], []).append(step["state"])
+        step["actions"] = [a for a in step["actions"] if not a["out"].startswith("Y")]
+    spec["preamble"] = [
+        {"out": "M1000", "logic": {"and": ["X0", {"not": "M1001"}, {"not": "X1"}, {"not": "M8002"}]}},
+        {"out": "M1001", "logic": "X0"},
+    ] + [{"out": output, "logic": {"or": states}} for output, states in outputs.items()]
+    return spec
+
+
 def generate(directory):
     """只向新文件写入，返回原生源码核验和耗时记录。"""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     spec = sequence_spec()
-    programs = {"顺启逆停_梯形图": ladder_program(), "顺启逆停_SFC": compile_sfc(spec, "FX3U")}
+    programs = {"顺启逆停_梯形图": ladder_program(), "顺启逆停_SFC": compile_stl(spec, "FX3U")}
     template = Path(__file__).parents[1] / "src/gxworks2_mcp/data/fx3u-ladder.gxw"
     reports = {}
     for name, program in programs.items():

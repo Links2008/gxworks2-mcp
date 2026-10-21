@@ -860,8 +860,11 @@ def import_program_csv(
         return int(match.group(1) or match.group(2))
 
     return {
-        # the step count is the authoritative proof that GX Works2 rebuilt the block
+        # Legacy heuristic only: unchanged step counts can still mean a correct
+        # replacement, and changed counts do not establish content equality.
         "ok": parse_steps(before_title) != parse_steps(after_title),
+        "content_verified": False,
+        "verification_required": "gx_verify_import",
         "title_before": before_title,
         "title_after": after_title,
         "steps_before": parse_steps(before_title),
