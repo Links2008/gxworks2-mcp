@@ -46,6 +46,28 @@ SFC 语言编辑器（图形块）的原生 .pou 记录格式仍在逆向边界�
 
 ## 安装
 
+### AI 批量写入的快速路径
+
+优先调用 `gx_program_prepare(name, cpu, rungs=[...])`，一次传入全部梯级；
+或用 `il="..."` 传完整指令表。FX 顺控使用已有的 `STL ... RET ... END`
+表示，不等同于 GX Works2 原生图形 SFC 编辑器。
+
+这一个调用完成生成、静态校验、保存及 CSV 导出，默认只返回摘要、全部校验消息和
+CSV 路径，不重复回显整个 IL/ASCII。需要预览时传 `preview=true`，或之后调用
+`gx_program_read`。校验错误会阻止写入；替换现有本地工程需 `overwrite=true`。
+`cpu` 必填，CSV 使用该 CPU 标签；需要精确机型描述时传 `cpu_label`。
+
+不要逐条调用 `gx_program_add_rungs`，也不要为每次调用重新启动 MCP 服务。
+保持同一个 stdio 会话。批量准备不会操作桌面或 PLC；CSV 导入仍单独调用
+`gx_import_csv(confirm=true)`，并在导入后编译、检查。详情与可重复基准见
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md)。
+
+增量修改用 `gx_program_slice` 读取稳定指令 ID 与版本，再用 `gx_program_patch`
+批量修改并刷新 CSV；旧版本拒绝写入。`gx_sfc_preview` 提供步骤表结构检查，
+但始终返回 `runnable=false`，尚不是 SFC 编译器。导入后可调用
+`gx_verify_import` 通过新导出 CSV 核对内容；仅提供一个 CSV 文件时只做离线比较，
+不会冒称实机导入验证。详见 [docs/EDIT_AND_VERIFY.md](docs/EDIT_AND_VERIFY.md)。
+
 需要 Python 3.10+。
 
 ```bash
@@ -254,3 +276,4 @@ tests/           62 个离线测试 + stdio 端到端 + pymcprotocol 交叉验�
 ## License
 
 MIT
+

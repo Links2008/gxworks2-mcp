@@ -36,7 +36,7 @@ COMMENT_HEADERS = (
     "statement",
 )
 INSTRUCTION_HEADERS = ("命令", "指令", "instruction", "command", "mnemonic")
-DEVICE_HEADERS = ("I/O(デバイス)", "I/O(软元件)", "I/O(デバイス名)", "device", "i/o", "operand")
+DEVICE_HEADERS = ("I/O(デバイス)", "I/O(软元件)", "I/O(デバイス名)", "I/O(Device)", "device", "i/o", "operand")
 PI_HEADERS = ("PIステートメント", "PI声明", "PI语句", "pi statement", "pi")
 NOTE_HEADERS = ("ノート", "注解", "注释", "备注", "note", "remark")
 
@@ -82,19 +82,48 @@ class CsvProgram:
     def to_il(self) -> str:
         """Convert the rows to IL text (comments become trailing // comments)."""
 
-        lines: list[str] = []
-        for row in self.rows:
+        # Additional operands are device-only continuation rows in the original
+        # GX Works2 export fixture (ito-soft-design/ladder_converter,
+        # test/files/src/MAIN.csv, blob f3957ff53867d9e265f60bbb6b01260e250cbb82).
+        # PI is a statement column, NEVER an extra-operand column.
+        instructions: list[tuple[str, list[str], str]] = []
+        for number, row in enumerate(self.rows, 1):
+            if row.pi.strip():
+                raise CSVFormatError(f"row {number}: nonempty PI statement cannot be converted losslessly")
             instruction = row.instruction.strip()
-            if not instruction:
-                continue
-            body = instruction
-            if row.device.strip():
-                body += " " + row.device.strip()
+            device = row.device.strip()
+            if any(c in instruction + device for c in "\r\n\t"):
+                raise CSVFormatError(f"row {number}: multiline instruction/operand is unsupported")
+            if device and (any(c.isspace() for c in device) or "//" in device or "#" in device):
+                raise CSVFormatError(f"row {number}: ambiguous operand field is unsupported")
+            if instruction and (any(c.isspace() for c in instruction) or ":" in instruction):
+                raise CSVFormatError(f"row {number}: unsupported instruction/label representation")
+            if row.interline and row.note and row.interline != row.note:
+                raise CSVFormatError(f"row {number}: multiple comment fields cannot be represented losslessly")
             comment = row.note.strip() or row.interline.strip()
-            if comment:
-                body += "  // " + comment
-            lines.append(body)
-        return "\n".join(lines)
+            if any(c in comment for c in "\r\n"):
+                raise CSVFormatError(f"row {number}: multiline comment is unsupported")
+            if not instruction:
+                if not device:
+                    raise CSVFormatError(f"row {number}: standalone metadata cannot be converted losslessly")
+                if not instructions or row.step or comment:
+                    raise CSVFormatError(f"row {number}: ambiguous or orphan operand continuation")
+                instructions[-1][1].append(device)
+                continue
+            instructions.append((instruction, [device] if device else [], comment))
+        lines = []
+        for mnemonic, operands, comment in instructions:
+            body = " ".join([mnemonic, *operands])
+            lines.append(body + ("  // " + comment if comment else ""))
+        text = "\n".join(lines)
+        # IL has its own comment/label syntax. A field that changes meaning when
+        # parsed must not be allowed to disappear in a read-back comparison.
+        parsed = parse_il(text)
+        expected = [(m.upper(), ops, comment or None) for m, ops, comment in instructions]
+        actual = [(i.mnemonic, i.operands, i.comment) for i in parsed.instructions]
+        if actual != expected or any(i.label is not None for i in parsed.instructions):
+            raise CSVFormatError("CSV fields cannot be represented losslessly in IL")
+        return text
 
     def to_program(self, title: str = "") -> Program:
         return parse_il(self.to_il(), title=title)
@@ -118,8 +147,10 @@ def _detect_columns(header: list[str]) -> dict[str, int] | None:
             ("pi", PI_HEADERS),
             ("note", NOTE_HEADERS),
         ):
-            if any(_normalise(alias) == key or _normalise(alias) in key for alias in aliases):
-                mapping.setdefault(name, index)
+            if any(_normalise(alias) == key for alias in aliases):
+                if name in mapping:
+                    raise CSVFormatError(f"duplicate {name} column")
+                mapping[name] = index
     if "instruction" not in mapping:
         return None
     return mapping
@@ -174,8 +205,8 @@ def read_program_csv(path: str | Path) -> CsvProgram:
                 return ""
             return row[index].strip()
 
-        if not cell("instruction") and not cell("device"):
-            continue
+        if any(value.strip() for index, value in enumerate(row) if index not in mapping.values()):
+            raise CSVFormatError("nonempty unmapped column cannot be converted losslessly")
         parsed.rows.append(
             CsvRow(
                 step=cell("step"),
@@ -202,7 +233,10 @@ def write_program_csv(
 
     The template below was verified against a live GX Works2 1.620W round trip
     (docs/RESEARCH.md E3): project name line, a PLC info line, the seven quoted
-    headers, then one row per instruction with UTF-16 LE + BOM and tab separators.
+    headers, then instruction rows and device-only operand continuation rows,
+    with UTF-16 LE + BOM and tab separators. Continuations follow the original
+    export fixture cited in CsvProgram.to_il; they have not been live-import
+    tested by this offline implementation.
 
         "demo1"
         "PLC信息:"\t"QCPU (Q mode) Q03UDV"
@@ -219,20 +253,7 @@ def write_program_csv(
     info = BANNER_PLC_LABELS.get(locale, BANNER_PLC_LABELS["zh"])
     rows: list[list[str]] = [list(r) for r in banner] if banner else [[project_name], [info, cpu_label]]
     rows.append(headers)
-    for index, instruction in enumerate(program.instructions):
-        device = instruction.operands[0] if instruction.operands else ""
-        extra = " ".join(instruction.operands[1:])
-        rows.append(
-            [
-                str(index),
-                "",
-                instruction.mnemonic,
-                device,
-                "",
-                extra,
-                instruction.comment or "",
-            ]
-        )
+    rows.extend(program_to_csv_rows(program))
     buffer = io.StringIO()
     writer = csv.writer(buffer, delimiter="\t", quoting=csv.QUOTE_ALL, lineterminator="\r\n")
     for row in rows:
@@ -285,7 +306,14 @@ def program_to_csv_rows(program: Program) -> list[list[str]]:
 
     rows: list[list[str]] = []
     for index, instruction in enumerate(program.instructions):
+        if instruction.label is not None:
+            raise CSVFormatError("IL labels have no verified GX Works2 CSV representation")
+        if any(not operand or operand != operand.strip() for operand in instruction.operands):
+            raise CSVFormatError("empty or padded operands cannot be represented losslessly")
         device = instruction.operands[0] if instruction.operands else ""
-        extra = " ".join(instruction.operands[1:])
-        rows.append([str(index), "", instruction.mnemonic, device, "", extra, instruction.comment or ""])
+        rows.append([str(index), "", instruction.mnemonic, device, "", "", instruction.comment or ""])
+        for operand in instruction.operands[1:]:
+            rows.append(["", "", "", operand, "", "", ""])
+    # Apply the same losslessness checks before writing any file content.
+    CsvProgram(rows=[CsvRow(r[0], r[1], r[2], r[3], r[5], r[6]) for r in rows]).to_il()
     return rows

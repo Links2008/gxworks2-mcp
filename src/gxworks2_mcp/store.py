@@ -34,6 +34,7 @@ from .blocks import ladder_blocks, render_ascii, to_boolean
 from .devices import DeviceError, parse_device
 from .il import Program, instruction_count, parse_il, render_il
 from .validate import summarize, validate_program
+from .locking import project_lock
 
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -91,6 +92,11 @@ class Project:
     def save(self, program: Program, *, comments: dict[str, str] | None = None) -> dict[str, object]:
         """Persist IL, structured JSON and device comments; return a write report."""
 
+        with project_lock(self):
+            return self._save_unlocked(program, comments=comments)
+
+    def _save_unlocked(self, program: Program, *, comments: dict[str, str] | None = None) -> dict[str, object]:
+
         self.root.mkdir(parents=True, exist_ok=True)
         il_text = render_il(program)
         self.il_path.write_text(il_text + "\n", encoding="utf-8")
@@ -144,12 +150,17 @@ class Store:
             )
         return self.projects_dir / name
 
-    def create(self, name: str, *, cpu: str = "Q", title: str = "", initial_il: str = "") -> Project:
+    def create(self, name: str, *, cpu: str = "Q", title: str = "", initial_il: str = "",
+               initial_program: Program | None = None) -> Project:
+        if initial_program is not None and initial_il:
+            raise StoreError("pass either initial_program or initial_il, not both")
+        program = initial_program if initial_program is not None else (
+            parse_il(initial_il, title=title or name) if initial_il else Program(title=title or name)
+        )
         project = Project(name=name, root=self.project_path(name), cpu=cpu)
         if project.exists():
             raise StoreError("project " + repr(name) + " already exists at " + str(project.root))
         project.root.mkdir(parents=True, exist_ok=False)
-        program = parse_il(initial_il, title=title or name) if initial_il else Program(title=title or name)
         project.save(program)
         return project
 
@@ -196,9 +207,10 @@ class Store:
 
     def delete(self, name: str) -> None:
         project = self.get(name)
-        for child in sorted(project.root.rglob("*"), reverse=True):
-            child.unlink() if child.is_file() else child.rmdir()
-        project.root.rmdir()
+        with project_lock(project):
+            for child in sorted(project.root.rglob("*"), reverse=True):
+                child.unlink() if child.is_file() else child.rmdir()
+            project.root.rmdir()
 
 
 def diff_programs(before: Program, after: Program) -> dict[str, object]:
@@ -213,6 +225,8 @@ def diff_programs(before: Program, after: Program) -> dict[str, object]:
                 for item in program.instructions]
 
     left, right = lines(before), lines(after)
+    if left == right:
+        return {"added": [], "removed": [], "before": len(left), "after": len(right), "changes": []}
     removed: list[str] = []
     added: list[str] = []
     changes: list[dict[str, object]] = []
