@@ -3,6 +3,7 @@
 import hashlib
 import json
 import struct
+import sys
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,9 @@ from gxworks2_mcp.gxw import GxwError, open_gxw, pou_stream, main_res_program
 from gxworks2_mcp.il import parse_il
 from gxworks2_mcp.native import encode_program, write_gxw
 from gxworks2_mcp.store import Store
+
+
+windows_storage = pytest.mark.skipif(sys.platform != "win32", reason="requires Windows IStorage / pywin32")
 
 
 TEMPLATE = Path(__file__).parents[1] / "src/gxworks2_mcp/data/fx3u-ladder.gxw"
@@ -30,6 +34,7 @@ def test_native_encoding_roundtrip(il):
     assert decoded["il"] == il
 
 
+@windows_storage
 def test_native_file_preserves_template_and_other_streams(tmp_path):
     source_hash = hashlib.sha256(TEMPLATE.read_bytes()).hexdigest()
     path = tmp_path / "native.gxw"
@@ -53,6 +58,7 @@ def test_native_writer_rejects_unknown_instruction(tmp_path):
     assert not (tmp_path / "bad.gxw").exists()
 
 
+@windows_storage
 def test_mcp_direct_writer_and_reader(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_store", Store(tmp_path / "store"))
     server.gx_program_create("native", cpu="FX3U", il="LD X10\nOUT Y0\nEND")
@@ -63,6 +69,7 @@ def test_mcp_direct_writer_and_reader(tmp_path, monkeypatch):
     assert source["decoded"] and "LD X10" in source["il"]
 
 
+@windows_storage
 def test_chinese_notes_use_project_codepage(tmp_path):
     path = tmp_path / "chinese.gxw"
     write_gxw(str(TEMPLATE), str(path), parse_il("LD X0\nOUT Y0  // 电机启动\nEND"))
@@ -90,6 +97,7 @@ def test_native_sfc_child_networks_are_not_a_complete_program():
     assert "SFC" in result["stopReason"] and "LD X0" in result["partialIl"]
 
 
+@windows_storage
 def test_memory_storage_grows_and_shrinks_without_touching_other_streams():
     import io
     import olefile
@@ -106,6 +114,7 @@ def test_memory_storage_grows_and_shrinks_without_touching_other_streams():
         expected = actual
 
 
+@windows_storage
 def test_disk_corruption_is_rejected_and_temporary_files_are_cleaned(tmp_path, monkeypatch):
     original_write = Path.write_bytes
     def corrupt_candidate(path, payload):
@@ -118,6 +127,7 @@ def test_disk_corruption_is_rejected_and_temporary_files_are_cleaned(tmp_path, m
     assert list(tmp_path.iterdir()) == []
 
 
+@windows_storage
 def test_large_source_crosses_sector_boundary_then_shrinks(tmp_path):
     large = parse_il("\n".join(f"LD X0\nOUT M{i}" for i in range(700)) + "\nEND")
     path = tmp_path / "large.gxw"
@@ -125,6 +135,7 @@ def test_large_source_crosses_sector_boundary_then_shrinks(tmp_path):
     assert write_gxw(str(path), str(tmp_path / "small.gxw"), parse_il("END"))["otherStreamsPreserved"]
 
 
+@windows_storage
 def test_valid_container_with_unrelated_stream_change_is_rejected(tmp_path, monkeypatch):
     from gxworks2_mcp import native
     replace = native._replace_cfb

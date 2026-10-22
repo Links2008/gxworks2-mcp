@@ -84,3 +84,68 @@ def test_native_cleanup_refuses_unowned_directory(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="归属"):
         _cleanup_native_temp(workspace)
     assert other.is_dir()
+
+
+def _minimal_cells():
+    return [
+        dict(x=0, y=0, type=26, substep=0, number=0, result=1),
+        dict(x=0, y=1, number=0, result=2),
+        dict(x=0, y=2, branch=3, result=3),
+        dict(x=0, y=3, type=15, number=0, result=1),
+    ]
+
+
+@pytest.mark.parametrize("extra, message", [
+    (dict(x=8, y=8, branch=0xA3, result=3), "分支类型"),
+    (dict(x=8, y=8, type=99, number=0, result=1), "步骤类型"),
+    (dict(x=8, y=8, type=4, number=0, result=1), "重复步骤"),
+    (dict(x=8, y=8, number=0, result=2), "重复转移"),
+    (dict(x=8, y=8, result=99), "格点类型"),
+    (dict(x=8, y=8, branch=3, result=3), "孤立格点"),
+])
+def test_readback_does_not_ignore_unsupported_or_orphan_cells(extra, message):
+    with pytest.raises(ValueError, match=message):
+        graph_edges(_minimal_cells() + [extra])
+
+
+def test_reachable_parallel_branch_is_rejected():
+    cells = _minimal_cells()
+    cells[2]["branch"] = 0xA3
+    with pytest.raises(ValueError, match="分支类型"):
+        graph_edges(cells)
+
+
+def test_unknown_native_dll_is_rejected_before_compiler_or_helper(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import gxworks2_mcp.native_sfc as native
+    dll = tmp_path / "Easysocket/CodeGenerator/ECCodeGeneratorFX2.dll"
+    dll.parent.mkdir(parents=True)
+    dll.write_bytes(b"synthetic unsupported native library; never executed")
+    monkeypatch.setattr(native, "os", SimpleNamespace(name="nt"))
+    def forbidden(*args, **kwargs):
+        pytest.fail("未知原生库不应触发编译器或辅助进程")
+    monkeypatch.setattr(native.subprocess, "run", forbidden)
+    with pytest.raises(ValueError, match="当前文件不匹配"):
+        native.native_batch([], str(tmp_path))
+
+
+def test_selection_branch_remains_supported_with_full_canvas_validation():
+    cells = [
+        dict(x=0, y=0, type=26, substep=0, number=0, result=1),
+        dict(x=0, y=1, branch=0x57, result=3),
+        dict(x=1, y=1, branch=0x5C, result=3),
+        dict(x=2, y=1, branch=0x59, result=3),
+        dict(x=0, y=2, number=0, result=2),
+        dict(x=2, y=2, number=1, result=2),
+        dict(x=0, y=3, type=15, number=0, result=1),
+        dict(x=2, y=3, type=15, number=0, result=1),
+    ]
+    assert graph_edges(cells) == [(0, 0, 0), (0, 1, 0)]
+
+
+def test_valid_edge_does_not_hide_dead_end_on_another_branch():
+    cells = _minimal_cells()
+    cells[2]["branch"] = 7
+    cells.append(dict(x=1, y=2, branch=8, result=3))
+    with pytest.raises(ValueError, match="没有出口"):
+        graph_edges(cells)

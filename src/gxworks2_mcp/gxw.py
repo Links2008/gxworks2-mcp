@@ -192,9 +192,12 @@ def _rows(diffgram: bytes, container: str) -> list[dict[str, str]]:
 def open_gxw(path: str | Path) -> GxwProject:
     """Open a .gxw and return its container view (no program decoding)."""
 
+    target = Path(path).expanduser()
+    if target.suffix.lower() == ".gpj":
+        raise GxwError("不支持 .gpj 工程；当前离线读取仅支持 GX Works2 .gxw 容器。"
+                       "请在原工程软件中另存或导出受支持的 .gxw 副本；修改扩展名不是格式转换。")
     if olefile is None:
         raise GxwError("olefile is required: py -m pip install olefile")
-    target = Path(path).expanduser()
     if not target.exists():
         raise GxwError("file not found: " + str(target))
     raw = target.read_bytes()
