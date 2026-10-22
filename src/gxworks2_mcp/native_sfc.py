@@ -214,11 +214,34 @@ def graph_edges(cells: list[dict]) -> list[tuple[int, int, int]]:
     grid = {(c["x"], c["y"]): c for c in cells}
     if len(grid) != len(cells):
         raise ValueError("图形连接包含重叠格点")
+    # Validate the entire canvas, not only paths reached from known steps.
+    # Otherwise an unsupported parallel branch or unknown symbol can disappear
+    # from the readback while the supported subset still compares equal.
+    step_numbers, transition_numbers = set(), set()
+    for cell in cells:
+        kind = cell["result"]
+        if kind == 1:
+            if cell["type"] not in (4, 10, 20, 26, 15):
+                raise ValueError("图形连接包含尚未支持的步骤类型")
+            if cell["type"] != 15:
+                if cell["number"] in step_numbers:
+                    raise ValueError("图形连接包含重复步骤编号")
+                step_numbers.add(cell["number"])
+        elif kind == 2:
+            if cell["number"] in transition_numbers:
+                raise ValueError("图形连接包含重复转移编号")
+            transition_numbers.add(cell["number"])
+        elif kind == 3:
+            if cell["branch"] & 0xF0 not in (0, 0x50):
+                raise ValueError("图形连接包含尚未支持的分支类型")
+        else:
+            raise ValueError("图形连接包含尚未支持的格点类型")
     steps = {c["number"]: c for c in cells
              if c["result"] == 1 and c["type"] in (4, 10, 20, 26)}
     if not steps:
         raise ValueError("图形连接没有步骤")
     result = []
+    covered = {(c["x"], c["y"]) for c in steps.values()}
     for number, source in steps.items():
         pending = [(source["x"], source["y"] + 1, 2, None)]
         visited = set()
@@ -232,6 +255,7 @@ def graph_edges(cells: list[dict]) -> list[tuple[int, int, int]]:
             cell = grid.get((x, y))
             if cell is None:
                 raise ValueError(f"图形连接中断于 {x},{y}")
+            covered.add((x, y))
             kind = cell["result"]
             if kind == 1:
                 if entry != 2 or transition is None or cell["number"] not in steps:
@@ -249,11 +273,15 @@ def graph_edges(cells: list[dict]) -> list[tuple[int, int, int]]:
             ports = cell["branch"] & 15
             if not ports & entry:
                 raise ValueError("图形连接端口不匹配")
+            if not ports & (1 | 4 | 8) & ~entry:
+                raise ValueError("图形连接包含没有出口的分支")
             for bit, dx, dy, opposite in ((1, 0, 1, 2), (4, 1, 0, 8), (8, -1, 0, 4)):
                 if ports & bit and bit != entry:
                     pending.append((x + dx, y + dy, opposite, transition))
         if not found:
             raise ValueError("步骤没有有效连接")
+    if covered != set(grid):
+        raise ValueError("图形连接包含未读取的孤立格点")
     return sorted(result)
 
 

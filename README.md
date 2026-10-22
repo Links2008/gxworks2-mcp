@@ -150,7 +150,7 @@ py -m pip install -e ".[native,dev]"     # Windows 原生写入与测试
 验证：
 
 ```bash
-py -m pytest -q                          # 离线测试，不需要 PLC / GX Works2
+py -m pytest -q                          # 离线回归；Windows IStorage 与原生集成按环境分层
 py tests/test_stdio_e2e.py              # 真实 MCP 握手、梯形图/SFC 原生写入与读回
 ```
 
@@ -293,11 +293,18 @@ devices.csv     # 软元件注释（可导入 GX Works2）
 
 ## 已知边界（重要）
 
+- **工程文件格式**：离线读取支持 `.gxw` OLE2 容器；`.gpj`（包括大写扩展名）明确拒绝，
+  不按损坏的 `.gxw` 猜测解析。请在原工程软件中另存或导出受支持副本，重命名扩展名不是转换。
+- **验证分层**：跨平台解析 / 生成测试不等同于 Windows IStorage、GX Works2 原生编译或
+  GX Simulator2 验收。非 Windows 平台显式跳过 IStorage 测试，未提供原生测试模板与安装目录
+  时跳过原生集成测试。完整验收步骤见 [兼容性与验收](docs/COMPATIBILITY.md)。
+
 - **解析范围按程序体报告**：简单梯形图源码可完整读回；结构化网络和原生 SFC 图形遇到
   未知结构立即停止，不把 partialIl 作为完整程序保存。应使用 `.Program.pou` 读取当前源码；
   `.res` 可能是上次编译缓存，源代码修改后两者不一定一致。
 - **默认写入为无窗口 GXW 源码通路**：只创建新文件，拒绝覆盖；其他流逐字节核验。
-  编译缓存仍需由 GX Works2 更新。原生 SFC 图形画布的直接新建尚未实现。
+  梯形图 / STL 源码写入的编译缓存仍需由 GX Works2 更新。`gx_sfc_write` 已支持
+  上述固定版本、双块模板下的原生 SFC 图形创建与整工程编译，不代表支持任意原生格式。
 - **旧 CSV 通路保留为备选**：1.620W 实测 Ctrl+V 无效（gx_paste_ladder 遗留）。
   gx_import_csv 驱动 编辑→「从CSV文件读取」：实测梯形图 2 步变 7 步、F4 编译无报错。
   官方对话框明说导入是**整块替换**，一个 CSV = 一个完整程序块，confirm=true 才执行。
@@ -314,8 +321,8 @@ devices.csv     # 软元件注释（可导入 GX Works2）
   远程 RUN 仍返回正常完成。因此 plc_remote_control 在 run/stop 后会**回读 SM0** 确认状态。
 - **MC 协议写入**默认被拦截（allow_write=false），因为写错地址会真的动设备。
 - 设备代码表按 QnA 兼容 3E 帧整理；FX 系列走同一套代码，个别机型扩展区需按手册核对。
-- 未实现：在线监视、ST 生成、原生 SFC 图形画布新建、通用厂商编译器替代。
-  已实现 FX3U 简单梯形图和 STL/RET 顺控的原生源码写入。
+- 未实现：在线监视、ST 生成、SFC 并行分支、任意版本 / 任意模板的原生图形写入、通用厂商编译器替代。
+  已实现 FX3U 简单梯形图、STL/RET 顺控的原生源码写入，以及限定版本与模板的原生 SFC 图形写入。
 
 ## 事实出处
 
