@@ -12,6 +12,8 @@
 
 面向 **GX Works2 / MELSEC** 的开源 MCP（Model Context Protocol）服务器，覆盖梯形图与 SFC 编写、原生 `.gxw` 读写、GX Simulator2 批量验收、不动作诊断、改动影响分析及调试资料交接。
 
+**支持通过标准 MCP 接入 Claude Code、Codex、WorkBuddy、DeepSeek Harness、Cursor 等智能体客户端**，将三菱 PLC 工程能力接入已有 AI 工作流。
+
 核心链路已在 **Windows + GX Works2 1.620 + FX3U/FX3UC** 的限定环境验证。AI 负责理解工艺和编写逻辑，MCP 负责确定性操作、检查与证据留存。第三方独立项目，与三菱电机无隶属关系。
 
 [快速开始](#快速开始) · [多 Agent 协作](#多-agent-协作) · [工具导航](#工具导航) · [验证结果](docs/公开版验收.md) · [支持范围](#支持范围)
@@ -26,6 +28,7 @@
 | **看懂“不动作”** | 按实际程序追踪未满足的常开/常闭、分支、步骤及 16/32 位整数比较条件，列出缺失采样 |
 | **看清“改了影响谁”** | 比较前后版本，追踪输出、步骤、定时器、计数器和连续字依赖，给出复测建议 |
 | **多 Agent 协作** | 编写、审查和测试可以分工；工程锁、指令 ID 与版本校验为协作提供基础 |
+| **多智能体客户端兼容** | 通过标准 stdio MCP 接入 Claude Code、Codex、WorkBuddy、DeepSeek Harness、Cursor 等客户端，复用同一套 PLC 工具 |
 | **交付有据可查** | 导出程序、I/O、注释、置复位清单、匹配版本证据和 SHA256；交接前再次核验资料及版本 |
 | **按需加载工程技能** | 内置三菱地址规划、模式/报警审查、工艺场景测试三个技能，避免每道题重复整理规则 |
 
@@ -52,7 +55,20 @@ py -m venv .venv
 
 ### 接入 AI 客户端
 
-支持标准 **stdio MCP** 接入。下面以采用 `mcpServers` 配置结构的客户端为例；将路径替换为本机实际路径，其他客户端使用其对应的 MCP 配置入口。
+支持标准 **stdio MCP** 接入，客户端在本地启动 Python 服务，并发现、调用 PLC 工具。不同智能体沿用各自的 MCP 配置方式：
+
+| 智能体 / 客户端 | 接入方式 | 官方说明 |
+|---|---|---|
+| **Claude Code** | `claude mcp add --transport stdio`，或项目 `.mcp.json` | [Claude Code MCP](https://code.claude.com/docs/en/mcp) |
+| **Codex** | `codex mcp add`，或 `~/.codex/config.toml` 中的 `[mcp_servers.gxworks2]` | [Codex MCP](https://developers.openai.com/codex/mcp) |
+| **WorkBuddy** | MCP 配置入口；用户级 `~/.workbuddy/mcp.json` 或项目级 `.workbuddy/mcp.json` | [WorkBuddy MCP](https://www.workbuddy.ai/docs/zh/workbuddy/From-Beginner-to-Expert-Guide/Function-Description/MCP-Guide) |
+| **DeepSeek Harness（DSH）** | `@deepseek-ai/dsh-mcp-client` 插件，设置 `transport: stdio` 及服务启动命令 | [DSH MCP Client](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/mcp/mcp-client/README.md) |
+| **Cursor** | 项目级 `.cursor/mcp.json` 或用户级 `~/.cursor/mcp.json` | [Cursor MCP](https://cursor.com/docs/mcp) |
+| **其他支持 stdio MCP 的智能体** | 配置 Python 可执行文件、模块参数与环境变量 | 以客户端自身的 MCP 文档为准 |
+
+以上为基于官方 MCP 能力的接入支持，核对日期为 **2026-10-23**。本项目已验证标准 stdio 握手、工具发现/调用及 DSH 同方式启动；尚未逐一完成所有客户端的完整工艺验收。原生写入、编译与模拟器功能仍要求服务运行在符合[支持范围](#支持范围)的 Windows 环境。
+
+下面的 JSON 适用于采用 `mcpServers` 结构的客户端；**Codex 使用 TOML，DSH 插件使用其配置格式**。将示例路径替换为本机实际路径：
 
 ```json
 {
