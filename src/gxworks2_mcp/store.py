@@ -73,8 +73,8 @@ class Project:
     def read_il(self) -> str:
         try:
             return self.il_path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return ""
+        except FileNotFoundError as exc:
+            raise StoreError(f"程序源文件不存在：{self.il_path}") from exc
 
     def read_program(self) -> Program:
         return parse_il(self.read_il(), title=self.name)

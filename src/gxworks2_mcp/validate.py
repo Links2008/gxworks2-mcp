@@ -14,6 +14,7 @@ from typing import Literal
 from .devices import DeviceError, DeviceRef, parse_device
 from .blocks import LogicError, build_rungs
 from .il import END, Instruction, Program, instruction_count
+from .semantics import semantic_issues
 
 Severity = Literal["error", "warning", "info"]
 
@@ -139,26 +140,15 @@ def validate_program(
 
     # 4) Block stack: ANB/ORB/MPS/MRD/MPP consistency.
     try:
-        rungs = build_rungs(program)
+        # FX 手册第7.6/7.7节：合并前最多保留8个 LD/LDI 块。
+        rungs = build_rungs(program, max_blocks=8 if cpu and cpu.upper().startswith('FX') else None)
     except LogicError as exc:
         issues.append(ValidationIssue("error", "LOGIC_STRUCTURE", str(exc)))
         rungs = []
 
     # 5) Double coils: the same device driven by two OUT-family instructions.
-    coil_sites: dict[str, list[int]] = {}
-    for line, ins in mnemonic_lines:
-        if ins.mnemonic in COIL_LIKE and ins.operands:
-            coil_sites.setdefault(ins.operands[0].upper(), []).append(line)
-    for device, lines in coil_sites.items():
-        if len(lines) > 1:
-            issues.append(
-                ValidationIssue(
-                    "warning",
-                    "DOUBLE_COIL",
-                    "device " + device + " is driven by " + str(len(lines)) + " coils (lines " + ", ".join(str(x) for x in lines) + "); in MELSEC the last one wins",
-                    device=device,
-                )
-            )
+    issues.extend(ValidationIssue(**row) for row in semantic_issues(
+        program, fx=bool(cpu and cpu.upper().startswith('FX'))))
 
     # 6) Unused contact-only operations: LD ... with no output in the rung.
     for rung in rungs:
@@ -202,11 +192,16 @@ def validate_program(
         issues.append(ValidationIssue("info", "LARGE_PROGRAM", "program has " + str(len(program.instructions)) + " instructions; consider splitting into sub-programs"))
 
     # 9) Application-instruction operand sanity (weights, hex constants).
+    from .author import DATA_ACTIONS
     for line, ins in mnemonic_lines:
-        if ins.mnemonic in {"MOV", "DMOV", "ADD", "DADD", "SUB", "DSUB", "MUL", "DMUL", "DIV", "DDIV", "CMP", "DCMP", "INC", "DINC", "DEC", "DDEC"}:
+        if ins.mnemonic in DATA_ACTIONS:
+            # 原始 IL 保留扩展寻址能力，这里只统一已知指令的参数数量。
+            if len(ins.operands) != DATA_ACTIONS[ins.mnemonic][0]:
+                issues.append(ValidationIssue('error','MISSING_OPERAND','数据指令操作数数量错误',line=line))
+        if ins.mnemonic in {"MOV", "DMOV", "ADD", "DADD", "SUB", "DSUB", "MUL", "DMUL", "DIV", "DDIV", "CMP", "DCMP"}:
             if len(ins.operands) < 2:
                 issues.append(ValidationIssue("error", "MISSING_OPERAND", ins.mnemonic + " requires a source and a destination", line=line))
-            elif ins.mnemonic.startswith("D") and ins.mnemonic in {"DMOV", "DADD", "DSUB", "DMUL", "DDIV", "DCMP"}:
+            elif ins.mnemonic in {"DMOV", "DADD", "DSUB", "DMUL", "DDIV"}:
                 dest = ins.operands[-1]
                 try:
                     ref = parse_device(dest)

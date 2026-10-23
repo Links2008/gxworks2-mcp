@@ -7,3 +7,9 @@ build/
 *.egg-info/
 .mcp-cache/
 *.log
+.env
+.env.*
+!.env.example
+/work/
+/AGENTS.md
+/plans/

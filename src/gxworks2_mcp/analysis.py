@@ -10,10 +10,14 @@ no PLC. Read-only; it never edits the program.
 from __future__ import annotations
 
 from typing import Any
+from dataclasses import replace
+import re
 
 from .blocks import Contact, Invert, Node, Parallel, Rung, Series, build_rungs
 from .devices import parse_device
 from .il import DEVICE_OPERAND_RE, Program, Instruction
+from .semantics import coil_writes, write_kind
+from .author import DATA_ACTIONS
 
 
 class AnalysisError(ValueError):
@@ -29,7 +33,7 @@ _RW_SHAPES = {
     "ADD": ("R", "R", "W"), "SUB": ("R", "R", "W"), "MUL": ("R", "R", "W"), "DIV": ("R", "R", "W"),
     "DADD": ("R", "R", "W"), "DSUB": ("R", "R", "W"), "DMUL": ("R", "R", "W"), "DDIV": ("R", "R", "W"),
     "INC": ("RW",), "DEC": ("RW",), "DINC": ("RW",), "DDEC": ("RW",),
-    "CMP": ("R", "R", "W"), "ZCP": ("R", "R", "R", "W"),
+    "CMP": ("R", "R", "W"), "DCMP": ("R", "R", "W"), "ZCP": ("R", "R", "R", "W"),
     "BMOV": ("R", "W", "R"), "FMOV": ("R", "W", "R"),
 }
 
@@ -46,24 +50,31 @@ def where_used(program: Program) -> dict[str, list[dict[str, Any]]]:
         operands = instruction.operands
         if not operands:
             continue
-        if instruction.mnemonic in _OUTPUT_LIKE:
+        op=instruction.mnemonic
+        base=op[:-1] if op not in DATA_ACTIONS and op.endswith('P') and op[:-1] in DATA_ACTIONS else op
+        meta=DATA_ACTIONS.get(base)
+        wide=bool(meta and meta[1]==32 or re.fullmatch(r'(?:LDD|ANDD|ORD)[<>=]+',op))
+        if op in _OUTPUT_LIKE:
             kinds = ["W"] + ["R"] * (len(operands) - 1)
-        elif instruction.mnemonic in _RW_SHAPES:
-            kinds = list(_RW_SHAPES[instruction.mnemonic])
+        elif base in _RW_SHAPES:
+            kinds = list(_RW_SHAPES[base])
         else:
             kinds = ["R"] * len(operands)
-        for device, kind in zip(operands, kinds):
+        for operand_index,(device, kind) in enumerate(zip(operands, kinds)):
             try:
-                key = str(parse_device(device))
+                ref=parse_device(device)
             except Exception:
                 continue
-            entry = {
-                "rung": index,
-                "kind": kind,
-                "instruction": str(instruction),
-                "comment": instruction.comment,
-            }
-            sites.setdefault(key, []).append(entry)
+            width=1
+            if ref.device in {'D','R','W','ZR'}:
+                width=meta[2] if meta and operand_index==len(operands)-1 else 2 if wide else 1
+            elif base in {'CMP','DCMP','ZCP'} and operand_index==len(operands)-1:
+                width=3
+            for offset in range(width):
+                key=str(replace(ref,index=ref.index+offset))
+                entry=dict(rung=index,kind=kind,instruction=str(instruction),comment=instruction.comment)
+                if offset:entry.update(implicit=True,baseDevice=str(ref))
+                sites.setdefault(key, []).append(entry)
     return dict(sorted(sites.items()))
 
 
@@ -108,14 +119,12 @@ def trace_device(program: Program, device: str, *, max_depth: int = 4) -> dict[s
         raise AnalysisError("cannot read device " + repr(device) + ": " + str(exc)) from exc
 
     writers: dict[str, list[Rung]] = {}
-    for rung in build_rungs(program):
-        ins = rung.instruction
-        if ins.mnemonic in _OUTPUT_LIKE and ins.operands:
-            try:
-                key = str(parse_device(ins.operands[0]))
-            except Exception:
-                continue
-            writers.setdefault(key, []).append(rung)
+    rungs={id(r.instruction):r for r in build_rungs(program)}
+    for key,sites in where_used(program).items():
+        for site in sites:
+            rung=rungs.get(id(program.instructions[site['rung']]))
+            if 'W' in site['kind'] and rung is not None:
+                writers.setdefault(key,[]).append(rung)
 
     def expand(name: str, depth: int, seen: set[str]) -> dict[str, Any]:
         node_out: dict[str, Any] = {"device": name, "writes": []}
@@ -129,11 +138,16 @@ def trace_device(program: Program, device: str, *, max_depth: int = 4) -> dict[s
             )
             return node_out
         if len(rungs) > 1:
-            node_out["multiWriter"] = str(len(rungs)) + " coils (last OUT wins each scan)"
+            sites = coil_writes(program).get(name, [])
+            kind = write_kind(name, sites, fx=any(i.mnemonic=='STL' for i in program))
+            node_out["multiWriter"] = (str(len(rungs))+" coils (last OUT wins each scan)"
+                                      if kind=='multiple_writes' and all(r.instruction.mnemonic=='OUT' for r in rungs)
+                                      else "多处写入，需结合置复位及 STL 状态核对执行关系")
         for rung in rungs:
             item: dict[str, Any] = {
                 "rung": rung.instruction.step if rung.instruction.step is not None else rung.steps[0],
                 "mnemonic": rung.instruction.mnemonic,
+                "operands": list(rung.instruction.operands),
                 "logic": _render(rung.logic),
             }
             if rung.instruction.comment:
@@ -165,11 +179,16 @@ def interlock_summary(program: Program) -> dict[str, Any]:
     usage = where_used(program)
     multi = {}
     dangling = []
+    coils = coil_writes(program)
+    fx = any(ins.mnemonic == 'STL' for ins in program)
+    classified = {d: write_kind(d, sites, fx=fx) for d, sites in coils.items()}
     for device, entries in usage.items():
-        writes = [e for e in entries if e["kind"] == "W"]
-        reads = [e for e in entries if e["kind"] != "W"]
-        if len(writes) > 1 and device[0] not in ("D", "W", "R", "ZR"):
+        writes = [e for e in entries if 'W' in e["kind"]]
+        reads = [e for e in entries if 'R' in e["kind"]]
+        ordinary=classified.get(device,'multiple_writes')=='multiple_writes' or len(writes)!=len(coils.get(device,[]))
+        if len(writes) > 1 and device[0] not in ("D", "W", "R", "ZR") and ordinary:
             multi[device] = len(writes)
         if writes and not reads:
             dangling.append(device)
-    return {"multiWriterCoils": multi, "writeOnlyDevices": sorted(dangling)}
+    return {"multiWriterCoils": multi, "writeOnlyDevices": sorted(dangling),
+            "writeSemantics": {d: kind for d, kind in classified.items() if len(coils[d]) > 1}}

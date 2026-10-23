@@ -180,6 +180,7 @@ static class WorkspaceSfc1620 {
   Check("ProjectName",Slot<FileName>(op,424)(op,input,out name,out c),c);string projectName=Text(name);
   if(String.IsNullOrEmpty(projectName)||projectName!=Path.GetFileName(projectName)||projectName=="."||projectName=="..")throw new InvalidOperationException("原生工程名称无效");
   Check("Import",Slot<Import>(op,416)(op,home,workspace,name,input,out c),c);
+  timings["importOnly"]=clock.ElapsedMilliseconds;
   string imported=Path.Combine(homePath,"isolated",projectName)+"\\";
   if(!File.Exists(imported+"Project.gd2")||new FileInfo(imported+"Project.gd2").Length==0)Check("CreateProjectHash",Slot<Pointer>(op,448)(op,B(imported),out c),c);
   Attributes attributes;Check("Attributes",Slot<GetAttr>(op,408)(op,home,workspace,name,out attributes,out c),c);
@@ -189,7 +190,7 @@ static class WorkspaceSfc1620 {
   IntPtr reserved=Alloc(48),parameter=Alloc(20);Marshal.StructureToPtr(new Project{Cpu=cpu,Name=B(""),Extra=B(""),Kind=3,Mode=-1},parameter,false);
   Check("Reserve",Slot<Reserve>(nav,288)(nav,IntPtr.Zero,parameter,reserved,out c),c);Check("Reserved",Slot<Pointer>(inside,12)(inside,reserved,out c),c);
   Id id;Check("Open",Slot<OpenCall>(op,340)(op,1,home,workspace,name,-1,16,0,out id,out c),c);
-  timings["importOpen"]=clock.ElapsedMilliseconds;clock.Restart();
+  timings["importOpen"]=clock.ElapsedMilliseconds;timings["openOnly"]=timings["importOpen"]-timings["importOnly"];clock.Restart();
   if(blocks!=null)Edit(ws,id,blocks);
   timings["edit"]=clock.ElapsedMilliseconds;clock.Restart();
   Check("Compiler",Slot<ProjectFunction>(ws,2560)(ws,id,0x10001,out f,out c),c);IntPtr compiler=Query(f,"99db1d02-f474-430d-bc1f-03abf0c7064b");
@@ -204,8 +205,9 @@ static class WorkspaceSfc1620 {
   Check("ProgramCheck",Slot<ProgramCheck>(resourceCompiler,180)(resourceCompiler,targets[0],-1,out c),c);var checkReports=Poll(resourceCompiler,40,true);
   timings["check"]=clock.ElapsedMilliseconds;clock.Restart();
   Check("Save",Slot<Save>(op,24)(op,home,workspace,name,0,id,0,out c),c);
+  timings["saveOnly"]=clock.ElapsedMilliseconds;
   Check("FinalizeProjectHash",Slot<Pointer>(op,448)(op,B(imported),out c),c);
-  timings["save"]=clock.ElapsedMilliseconds;clock.Restart();
+  timings["save"]=clock.ElapsedMilliseconds;timings["hashOnly"]=timings["save"]-timings["saveOnly"];clock.Restart();
   Check("Export",Slot<Export>(op,420)(op,home,workspace,name,B(Path.Combine(directory,"output.gxw")),3,0,0,out c),c);
   timings["export"]=clock.ElapsedMilliseconds;
   return new{compileStatus="accepted",checkStatus="accepted",errors=0,warnings=checkReports.FindAll(r=>(int)r["kind"]==3).Count,

@@ -27,6 +27,11 @@ class ILParseError(ValueError):
 CONTACT_START = {"LD", "LDI", "LDP", "LDF"}
 CONTACT_SERIES = {"AND", "ANI", "ANDP", "ANDF"}
 CONTACT_PARALLEL = {"OR", "ORI", "ORP", "ORF"}
+COMPARISON_CONTACTS = {base+op for base in ('LD','AND','OR','LDD','ANDD','ORD')
+                       for op in ('=','<>','>','>=','<','<=')}
+CONTACT_START |= {x for x in COMPARISON_CONTACTS if x.startswith('LD')}
+CONTACT_SERIES |= {x for x in COMPARISON_CONTACTS if x.startswith('AND')}
+CONTACT_PARALLEL |= {x for x in COMPARISON_CONTACTS if x.startswith('OR')}
 BLOCK_JOIN = {"ANB", "ORB"}
 STACK_OPS = {"MPS", "MRD", "MPP", "INV"}
 OUTPUTS = {"OUT", "SET", "RST", "PLS", "PLF", "OUTH", "OUTL", "OUTF"}
@@ -36,6 +41,7 @@ END = "END"
 #: (program control, application instructions, ...) and keep their operands verbatim.
 ARITY: dict[str, int] = {
     **{mnemonic: 1 for mnemonic in CONTACT_START | CONTACT_SERIES | CONTACT_PARALLEL | OUTPUTS},
+    **{mnemonic: 2 for mnemonic in COMPARISON_CONTACTS},
     **{mnemonic: 0 for mnemonic in BLOCK_JOIN | STACK_OPS | {END}},
     "NOP": 1,
     "NOPLF": 0,

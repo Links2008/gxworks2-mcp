@@ -56,6 +56,13 @@ END_CODES: dict[int, str] = {
     0xC0B5: "the target CPU rejects the request in its current state (e.g. write while running)",
 }
 
+#: 只读查找用的少量候选。5001 没有官方定义，不在表内；也不扫描 1..65535。
+MC_PORT_CANDIDATES = (
+    (5000, "tcp", "库常用 MC TCP，不是协议规定；Q 系列自局端口示例排除 5000–5009"),
+    (5555, "tcp", "FX3U-ENET 常见端口"),
+    (5556, "tcp", "FX3U-ENET-ADP 官方 FAQ 要求改为 5556"),
+)
+
 COMMANDS = {
     "batch_read": 0x0401,
     "batch_write": 0x1401,
@@ -160,6 +167,8 @@ class MCClient:
     def connect(self) -> "MCClient":
         if self._socket is not None:
             return self
+        self.config.transport = normalize_transport(self.config.transport)
+        self.config.port = normalize_port(self.config.port)
         kind = socket.SOCK_STREAM if self.config.transport == "tcp" else socket.SOCK_DGRAM
         sock = socket.socket(socket.AF_INET, kind)
         sock.settimeout(self.config.timeout)
@@ -387,26 +396,54 @@ def pack_bits(bits: Iterable[int]) -> bytes:
     return bytes(packed)
 
 
+def normalize_transport(transport: object) -> Transport:
+    """接受 tcp/udp 的大小写。其他值直接拒绝，不能把它们当成 UDP。"""
+
+    if not isinstance(transport, str):
+        raise MCProtocolError("transport 只支持 tcp 或 udp，收到 " + repr(transport))
+    text = transport.strip().lower()
+    if text not in ("tcp", "udp"):
+        raise MCProtocolError("transport 只支持 tcp 或 udp，收到 " + repr(transport))
+    return text  # type: ignore[return-value]
+
+
+def normalize_port(port: object) -> int:
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise MCProtocolError("port 必须是 1..65535 的整数")
+    return port
+
+
 def probe(
     host: str,
     port: int = 5000,
     timeout: float = 2.0,
     transport: Transport = "tcp",
 ) -> dict[str, object]:
-    """Check whether something MC-protocol-shaped answers at host:port."""
+    """Read the CPU model at one endpoint. This command does not write or remote-control."""
 
-    config = MCConfig(host=host, port=port, timeout=timeout, transport=transport)
     try:
+        transport = normalize_transport(transport)
+        port = normalize_port(port)
+        if not isinstance(host, str) or not host.strip():
+            raise MCProtocolError("host 必须是非空字符串")
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not timeout > 0:
+            raise MCProtocolError("timeout 必须是正数秒")
+        config = MCConfig(host=host.strip(), port=port, timeout=float(timeout), transport=transport)
         with MCClient(config) as client:
             cpu = client.cpu_type()
-        return {"reachable": True, "host": host, "port": port, "transport": transport, "cpu_type": cpu}
+        if not isinstance(cpu, str) or not cpu.strip():
+            raise MCProtocolError("CPU 型号读取为空，不把该端口当成已识别 PLC")
+        return {"reachable": True, "host": host.strip(), "port": port, "transport": transport,
+            "cpu_type": cpu.strip(), "writes": 0, "command": "0101"}
     except MCProtocolError as exc:
         return {
             "reachable": False,
-            "host": host,
+            "host": host.strip() if isinstance(host, str) else host,
             "port": port,
             "transport": transport,
             "error": str(exc),
+            "writes": 0,
+            "command": "0101",
             "end_code": None if exc.end_code is None else "0x" + format(exc.end_code, "04X"),
             "end_code_text": exc.description,
         }

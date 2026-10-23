@@ -503,6 +503,12 @@ def _read_operand(stream, i, cpu=""):
             return ('K' + str(int.from_bytes(stream[i + 2:i + 4], 'little', signed=True)), i + 5)
         if stream[i + 1] == 0xEA:
             return ('H' + format(int.from_bytes(stream[i + 2 : i + 4], 'little'), '04X'), i + 5)
+    if cpu.upper().startswith('FX3U') and i+7 <= len(stream) and stream[i]==7 and stream[i+6]==7:
+        code=stream[i+1]
+        if code==0xE8:
+            return ('K'+str(int.from_bytes(stream[i+2:i+6],'little',signed=True)),i+7)
+        if code==0xEA:
+            return ('H'+format(int.from_bytes(stream[i+2:i+6],'little'),'08X'),i+7)
     return None
 
 

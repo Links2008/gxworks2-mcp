@@ -1,0 +1,12 @@
+参考项目：Mitsubishi-NetToGXSim2 / NetToGXSim2
+作者（上游 README）：Ismail Lowkey
+来源：https://github.com/ismaillowkey/Mitsubishi-NetToGXSim2
+参考文件：src/NetToGXSim2.Core/GxSim2MemoryBridge.cs
+核对日期：2026-10-21
+
+上游 README 声明项目采用 MIT License；核对时根目录 LICENSE 链接返回404，
+因此此处不杜撰其版权年份或不存在的许可证原文，也不将子目录 IoTClient 的许可证当作该文件许可。
+
+本项目参考该文件公开的 FXSimRun2 数据区位置和软元件布局事实，独立编写 Python 访问实现，
+并用本机模拟器界面写入和实际程序运行进行交叉验证。
+未捆绑上游 C# 实现、网络服务器、OPC 组件或安装程序。

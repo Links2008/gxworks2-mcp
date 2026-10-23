@@ -21,13 +21,16 @@ GX Works2 desktop bridge (optional, Windows only; UIA-driven, no mouse needed)
   gx_open_project             ask GX Works2 to open a .gxw project
 
 Live PLC (MC protocol 3E frame, independent of GX Works2)
-  plc_probe                   check whether host:port answers MC protocol
+  plc_list_ports              passive COM inventory; does not open serial ports
+  plc_find_ports              read-only CPU-model probe of TCP 5000/5555/5556
+  plc_probe                   check whether one host:port answers MC protocol
   plc_read                    read bits/words from devices
   plc_write            WRITE  write bits/words to devices
   plc_remote_control   WRITE  remote RUN / STOP / PAUSE / latch clear
 
-The write tools are the only ones with side effects. plc_write refuses unless
-allow_write is passed as true, and gx_paste_ladder refuses unless confirm=true.
+The write tools are the only ones with side effects. plc_write asks 「现在写入吗？」
+and refuses unless the user has agreed and both confirm and allow_write are true.
+gx_paste_ladder refuses unless confirm=true.
 """
 
 from __future__ import annotations
@@ -67,6 +70,28 @@ from .sfc import SFCError, preview_sfc, compile_stl, describe_sfc
 DEFAULT_WORKSPACE = Path(os.environ.get("GXWORKS2_MCP_HOME", Path.home() / ".gxworks2-mcp"))
 
 _INSTRUCTIONS = (
+    "调试交付用gx_handover_export(name)新建资料ZIP；只归档本会话匹配版本证据。"
+    "交接前用gx_handover_verify(path,name可选)只读核验资料及工作区版本；完整性不等于来源或现场验收认证。"
+    "需要归档仿真验证时给gx_simulator_verify传project_name；不代表已认证模拟器代码，缺项与现场签字不能编造。"
+    "比较修改前后影响用gx_change_impact(before_name,after_name)，只读两个已存程序；"
+    "报告为静态候选范围，复测建议未执行，不据此认定可下载或外部映射完整。"
+    "排查Y/M输出不动作时用gx_diagnose_output：传name/device，可提供snapshot；"
+    "未传snapshot只读现有FX模拟器，不启动、停止或写入。支持16/32位整数比较，D快照用原始16位字。"
+    "先核对程序版本，遵守未知/锁存/多写入等限制。"
+    "规划软元件、审查模式/报警或设计工艺测试时，用 gx_skill_list 查看三个工程技能，"
+    "再按需 gx_skill_read(name) 读取匹配技能；普通小修改无需全部加载。"
+    "结构化数据回路使用 instruction 与 operands，例如 MOV 的 operands=['K10','D0']；"
+    "比较条件使用 compare={op:'>=',left:'D0',right:'K10',bits:16}，bits可为16或32。"
+    "仿真 read 支持D、C触点和CN当前值；types按地址指定int16/uint16/int32/uint32。"
+    "verify支持hold_ms持续保持、min_delay_ms最早响应及全批forbid禁止组合；结论只覆盖采样观察。"
+    "连续按键需要按工艺确认程序接收松开，或验证足够的松开保持区间。"
+    "真实本地仿真使用 gx_simulator_*：start/status/control/stop、read、inputs、press、verify。"
+    "这些工具只访问已核对版本的FX Simulator2，X/Y按八进制，T为触点、TN为当前值；"
+    "只向虚拟X输入写0/1，不允许Y/M/S输出覆写。先确认状态，再批量给输入并读实际输出；"
+    "不要用plc_probe/plc_find_ports/plc_write连接GX Simulator2，也不要用离线扫描模型冒充真实仿真。"
+    "plc_find_ports 只登记串口并只读探测 TCP 5000、5555、5556；没有唯一 CPU 型号就不代选端口。"
+    "plc_write 写入前必须把主机、端口、软元件和数值告诉用户，并询问「现在写入吗？」。"
+    "只有用户明确同意后，才可同时传 confirm=true 与 allow_write=true；不得自行确认。"
     "FX3U 原生 SFC 使用 gx_sfc_write：一次提交完整 spec，原生编译、检查、保存和读回；"
     "gx_sfc_read 离线读取图形步骤、动作和条件，不启动原生进程。"
     "简单梯形图可用 gx_write_project 写出源码，仍需另行编译。"
@@ -99,6 +124,109 @@ def store() -> Store:
 
 
 # --- program authoring ------------------------------------------------------
+
+@server.tool()
+def gx_skill_list() -> str:
+    """只读列出三菱工程技能名称和适用任务；不加载正文、不操作工程或PLC。"""
+    from .skill_library import list_skills
+    return json.dumps(dict(ok=True,skills=list_skills()),ensure_ascii=False)
+
+
+@server.tool()
+def gx_skill_read(name: str) -> str:
+    """只读一个已登记工程技能；使用gx_skill_list返回的name，不接受文件路径。"""
+    from .skill_library import read_skill
+    try:return json.dumps(dict(ok=True,**read_skill(name)),ensure_ascii=False)
+    except (ValueError,OSError) as exc:return json.dumps(dict(ok=False,error=str(exc)),ensure_ascii=False)
+
+def _sim_result(operation, *args):
+    """模拟器工具统一返回失败原因，不回退到实体 PLC 接口。"""
+    try:
+        return json.dumps(operation(*args), ensure_ascii=False)
+    except (OSError, ValueError, KeyError, TypeError, StopIteration) as exc:
+        return json.dumps(dict(ok=False,error=str(exc),physicalPlc=False),ensure_ascii=False)
+
+
+@server.tool()
+def gx_simulator_status() -> str:
+    """查询真实 GX Simulator2 虚拟 CPU、已核验版本和 RUN/STOP 开关状态。"""
+    from .simulator_ui import status
+    return _sim_result(status)
+
+
+@server.tool()
+def gx_simulator_start(confirm: bool = False) -> str:
+    """启动当前可见 GXW 工程的本地仿真，并确认传输完成和监视视图；不连接实体 PLC。"""
+    if not confirm:return json.dumps(dict(ok=False,error='启动仿真需要confirm=true',physicalPlc=False))
+    from .simulator_ui import start
+    return _sim_result(start)
+
+
+@server.tool()
+def gx_simulator_stop(confirm: bool = False) -> str:
+    """通过 GX Works2 正常结束当前仿真，不强杀进程。"""
+    if not confirm:return json.dumps(dict(ok=False,error='结束仿真需要confirm=true',physicalPlc=False))
+    from .simulator_ui import stop
+    return _sim_result(stop)
+
+
+@server.tool()
+def gx_simulator_control(action: str, confirm: bool = False) -> str:
+    """操作虚拟 CPU 开关：run 或 stop，并核对面板状态。"""
+    if not confirm:return json.dumps(dict(ok=False,error='切换虚拟CPU需要confirm=true',physicalPlc=False))
+    from .simulator_ui import cpu_control
+    return _sim_result(cpu_control,action)
+
+
+@server.tool()
+def gx_simulator_read(devices: list[str], types: dict[str, str] | None = None) -> str:
+    """读取 X/Y/M/S/T/TN/C/CN/D；types 可选 uint16/int16/uint32/int32，32位D读取连续两字。"""
+    from .simulator import read_devices
+    return _sim_result(read_devices,devices,types)
+
+
+@server.tool()
+def gx_simulator_inputs(values: dict[str, int], confirm: bool = False) -> str:
+    """批量模拟按键和传感器：只允许向虚拟 X 输入写0/1，保留其他输入并读回。"""
+    if not confirm:return json.dumps(dict(ok=False,error='修改虚拟输入需要confirm=true',physicalPlc=False))
+    from .simulator import write_inputs
+    return _sim_result(write_inputs,values)
+
+
+@server.tool()
+def gx_simulator_press(device: str, duration_ms: int = 100, confirm: bool = False) -> str:
+    """模拟按下并松开一个虚拟 X 按钮，20..2000毫秒，异常时也尝试释放同一实例。"""
+    if not confirm:return json.dumps(dict(ok=False,error='模拟按键需要confirm=true',physicalPlc=False))
+    from .simulator import pulse
+    return _sim_result(pulse,device,duration_ms)
+
+
+@server.tool()
+def gx_simulator_verify(steps: list[dict[str, Any]], confirm: bool = False,
+                        forbid: list[dict[str, int]] | None = None, sample_ms: int = 20,
+                        project_name: str = "") -> str:
+    """批量验证时间窗与禁止组合，失败即停；可选project_name将实际结果绑定到工作区版本供归档。"""
+    if not confirm:return json.dumps(dict(ok=False,error='执行仿真动作验证需要confirm=true',physicalPlc=False))
+    from .simulator import verify
+    if not project_name:return _sim_result(verify,steps,forbid,sample_ms)
+    from .handover import program_hash,remember_evidence
+    try:
+        project=store().get(project_name)
+        with project_lock(project):
+            program=project.read_program()
+            if not len(program):raise StoreError('程序源文件为空，不能绑定仿真验证版本')
+            version=program_hash(program)
+    except (StoreError,OSError,ValueError) as exc:
+        return json.dumps(dict(ok=False,error=str(exc),physicalPlc=False),ensure_ascii=False)
+    result=json.loads(_sim_result(verify,steps,forbid,sample_ms))
+    try:
+        with project_lock(project):stable=version==program_hash(project.read_program())
+    except (OSError,ValueError,TimeoutError) as exc:
+        result.update(archiveEvidenceId=None,archiveWarning='验证后无法核对版本：'+str(exc))
+        return json.dumps(result,ensure_ascii=False)
+    result['archiveEvidenceId']=remember_evidence(project,version,'simulator_verify',dict(
+        result=result,workspaceStable=stable,programMatchVerified=False))
+    return json.dumps(result,ensure_ascii=False)
 
 @contextmanager
 def _temporary_workspace(prefix: str, directory: Path):
@@ -813,12 +941,100 @@ def gx_trace_device(name: str, device: str, max_depth: int = 4) -> str:
 
 
 @server.tool()
-def gx_lint_program(name: str) -> str:
-    """Static review: multi-writer coils and write-only devices.
+def gx_diagnose_output(name: str, device: str, snapshot: dict[str, Any] | None = None) -> str:
+    """只读诊断FX3U的Y/M输出：解释未满足位条件及16/32位整数比较，保留与/或关系。
 
-    The two classics that bite PLC programmers: a coil driven from several
-    rungs (only the last OUT wins per scan), and devices written but never
-    read (dead logic). Structural checks still live in gx_program_validate.
+    snapshot传原始地址整数值时离线分析；省略则只读现有FX Simulator2。
+    不启动/控制/写入模拟器或实体PLC；程序与采样版本对应关系须另行核对。
+    """
+    from datetime import datetime, timezone
+    from .diagnostics import diagnose_output
+    try:
+        project=store().get(name)
+        if project.cpu.upper() not in {'FX3U','FX3UC','FX3U/FX3UC'}:
+            raise ValueError('不动作诊断当前仅验证FX3U/FX3UC')
+        with project_lock(project):
+            program=project.read_program();comments=project.device_comments()
+            result=diagnose_output(program,device,snapshot if snapshot is not None else {},comments)
+            source=dict(source='provided snapshot',sampledAt=None,atomic=False)
+            if snapshot is None:
+                from .simulator import read_devices
+                source=read_devices(result['requiredDevices'])
+                result=diagnose_output(program,device,source['values'],comments)
+                source={k:v for k,v in source.items() if k!='values'}
+                source.update(sampledAt=datetime.now(timezone.utc).isoformat(),atomic=False)
+            result.update(project=name,programSha256=hashlib.sha256(render_il(program).encode('utf-8')).hexdigest(),sampling=source)
+            from .handover import remember_evidence
+            remember_evidence(project,result['programSha256'],'diagnostic',result)
+            return json.dumps(result,ensure_ascii=False)
+    except (StoreError, OSError, ValueError, KeyError, TypeError) as exc:
+        return json.dumps(dict(ok=False,readOnly=True,physicalPlc=False,error=str(exc),
+            hint='核对项目/地址；无仿真时可提供snapshot离线诊断。'),ensure_ascii=False)
+
+
+@server.tool()
+def gx_change_impact(before_name: str, after_name: str, limit: int = 50) -> str:
+    """只读比较两个FX3U/FX3UC程序，追踪变更影响的输出/步骤/定时器/连续字并建议复测。
+
+    before_name与after_name为已有程序名；limit限制明细条数，不截断地址汇总。
+    不编辑、编译、启动软件或访问PLC；复杂控制流与未知寻址明确扩大候选范围。
+    """
+    from contextlib import ExitStack
+    from .impact import change_impact
+    try:
+        before=store().get(before_name);after=store().get(after_name)
+        if any(p.cpu.upper() not in {'FX3U','FX3UC','FX3U/FX3UC'} for p in (before,after)):
+            raise ValueError('改动影响报告当前仅验证FX3U/FX3UC')
+        with ExitStack() as locks:
+            projects={str(p.root):p for p in (before,after)}
+            for key in sorted(projects):locks.enter_context(project_lock(projects[key]))
+            result=change_impact(before.read_program(),after.read_program(),limit=limit)
+            result.update(beforeProject=before_name,afterProject=after_name,
+                          cpuTypes={'before':before.cpu,'after':after.cpu})
+            from .handover import remember_evidence
+            remember_evidence(before,result['beforeSha256'],'impact',result,role='before')
+            remember_evidence(after,result['afterSha256'],'impact',result,role='after')
+            return json.dumps(result,ensure_ascii=False)
+    except (StoreError,OSError,ValueError,KeyError,TypeError) as exc:
+        return json.dumps(dict(ok=False,readOnly=True,physicalPlc=False,error=str(exc),
+            hint='先保存修改前后两个程序，再核对程序名和比较范围。'),ensure_ascii=False)
+
+
+@server.tool()
+def gx_handover_export(name: str, path: str = "") -> str:
+    """新建调试资料ZIP：IL、I/O注释、步骤置复位、静态检查和本会话匹配版本证据。
+
+    不改源程序、不操作模拟器/PLC；path省略时写工作区handover目录，已有文件拒绝覆盖。
+    不含原生GXW全工程，缺失标签/签字保留待填，静态建议与仿真记录不能代替现场验收。
+    """
+    from .handover import export_handover
+    try:return json.dumps(export_handover(store().get(name),path or None),ensure_ascii=False)
+    except (StoreError,OSError,ValueError,KeyError,TypeError) as exc:
+        return json.dumps(dict(ok=False,error=str(exc),programModified=False,physicalPlc=False),ensure_ascii=False)
+
+
+@server.tool()
+def gx_handover_verify(path: str, name: str = "") -> str:
+    """只读核验资料ZIP的文件、CRC、哈希及证据版本；name可选比较工作区CPU和代码。
+
+    不解压、不导入、不访问模拟器/PLC。workspaceMatch为空表示未比较工作区。
+    完整性通过不证明来源真实、仿真装载代码一致或现场已验收。
+    """
+    from .handover import verify_handover
+    try:
+        return json.dumps(verify_handover(path,store().get(name) if name else None),ensure_ascii=False)
+    except (StoreError,OSError,ValueError,KeyError,TypeError,RecursionError) as exc:
+        return json.dumps(dict(ok=False,error=str(exc),readOnly=True,programModified=False,
+            simulatorAccessed=False,physicalPlc=False),ensure_ascii=False)
+
+
+@server.tool()
+def gx_lint_program(name: str) -> str:
+    """Static review: contextual coil writes and write-only devices.
+
+    SET/RST and FX STL state outputs are classified separately. Write-only
+    devices are inventory for review, not proof of dead logic (outputs may
+    drive external equipment). Structural checks live in gx_program_validate.
     """
 
     try:
@@ -1030,8 +1246,38 @@ def _client(host: str, port: int, timeout: float, transport: str) -> MCClient:
 
 
 @server.tool()
+def plc_list_ports() -> str:
+    """被动枚举本机 COM 口，区分已知蓝牙映射；不打开端口或连接、写入 PLC。
+
+    plcVerified=false 表示尚未通过协议读取 CPU 身份。
+    不可仅凭 COM 编号或 USB 转串口线品牌选择下载目标。
+    """
+    from .ports import list_ports
+    try:
+        return json.dumps(list_ports(), ensure_ascii=False)
+    except OSError as exc:
+        return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+
+@server.tool()
+def plc_find_ports(host: str = "127.0.0.1", timeout: float = 1.0) -> str:
+    """只读寻找 MC 端口，并附带未打开的串口登记。
+
+    不打开 COM，不写软元件，不远程 RUN/STOP，也不下载。候选只有 TCP 5000、5555、5556。
+    恰好一个候选返回 CPU 型号才给出 selected；没有或多个都不代选。
+    5000 不是协议规定的端口。GX Simulator2 不监听这些端口，请改用 gx_simulator_status。
+    """
+    from .ports import find_ports
+    try:
+        return json.dumps(find_ports(host, timeout), ensure_ascii=False)
+    except (OSError, ValueError, TypeError) as exc:
+        return json.dumps({"ok": False, "error": str(exc), "writes": 0, "openedSerialPorts": 0},
+            ensure_ascii=False)
+
+
+@server.tool()
 def plc_probe(host: str = "127.0.0.1", port: int = 5000, timeout: float = 2.0, transport: str = "tcp") -> str:
-    """Check whether an MC-protocol endpoint answers (GX Simulator2, or a real PLC)."""
+    """Check an MC-protocol endpoint with a CPU-model read. GX Simulator2 uses gx_simulator_status instead."""
 
     return json.dumps(mc_probe(host, port, timeout, transport), ensure_ascii=False, indent=2)  # type: ignore[arg-type]
 
@@ -1076,12 +1322,35 @@ def plc_write(
     timeout: float = 3.0,
     transport: str = "tcp",
     allow_write: bool = False,
+    confirm: bool = False,
 ) -> str:
-    """Write values to devices on a live PLC (WRITE; requires allow_write=true)."""
+    """写在线 PLC 软元件。写入前必须问用户「现在写入吗？」。
 
-    if not allow_write:
+    用户明确同意后才可同时传 confirm=true 与 allow_write=true。
+    未确认时不连接、不写入。
+    """
+
+    if confirm is not True:
         return json.dumps(
             {
+                "ok": False,
+                "written": 0,
+                "needsUserConfirmation": True,
+                "question": "现在写入吗？",
+                "error": "写入前必须先问用户「现在写入吗？」。用户明确同意后，再同时传 confirm=true 和 allow_write=true。",
+                "host": host,
+                "port": port,
+                "device": device,
+                "values": values,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    if allow_write is not True:
+        return json.dumps(
+            {
+                "ok": False,
+                "written": 0,
                 "error": "refusing to write without allow_write=true",
                 "reason": "this writes to a live PLC; a wrong address can move a machine. "
                 "Re-issue the call with allow_write=true once the device list is reviewed.",

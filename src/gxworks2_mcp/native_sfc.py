@@ -105,8 +105,9 @@ def sequence_blocks(spec: dict) -> tuple[dict, list[dict]]:
     )).decode()) for i, s in enumerate(spec["steps"])]
     bodies += [dict(kind="transition", number=t["number"], body=base64.b64encode(
         _body(parse_il("\n".join(compile_logic(t["when"]))))).decode()) for t in layout["transitions"]]
-    reset = [line for step in spec["steps"] for line in ("LD M8002", "RST " + step["state"])]
-    initial = parse_il("\n".join(reset + ["LD M8002", "SET " + spec.get("initial", spec["steps"][0]["state"])]))
+    reset_logic = compile_logic({"or": ["M8002", spec["reset"]]}) if "reset" in spec else ["LD M8002"]
+    reset = [line for step in spec["steps"] for line in [*reset_logic, "RST " + step["state"]]]
+    initial = parse_il("\n".join(reset + [*reset_logic, "SET " + spec.get("initial", spec["steps"][0]["state"])]))
     initial.instructions.extend(ins for rung in spec.get("preamble", []) for ins in compile_rung(rung))
     startup = dict(tokens=base64.b64encode(bytes.fromhex(
         "056c02170504980004056c021d0504990004056202000504980004056c010a05")).decode(),
@@ -127,7 +128,7 @@ def layout_sfc(spec: dict) -> dict:
             pending.extend((v, depth + 1) for v in value.values())
         elif isinstance(value, list):
             pending.extend((v, depth + 1) for v in value)
-    if not isinstance(spec, dict) or set(spec) - {"initial", "steps", "preamble"}:
+    if not isinstance(spec, dict) or set(spec) - {"initial", "steps", "preamble", "reset"}:
         raise GxwError("SFC 输入含未知字段")
     if not isinstance(spec.get("steps"), list) or not 1 <= len(spec["steps"]) <= 64:
         raise GxwError("原生 SFC 需要 1..64 个步骤")
@@ -142,11 +143,14 @@ def layout_sfc(spec: dict) -> dict:
             if not isinstance(edge, dict) or set(edge) != {"to", "when"}:
                 raise GxwError("SFC 转移必须只含 to 和 when")
     rungs = [*spec.get("preamble", []), *(a for s in spec["steps"] for a in s.get("actions", []))]
+    from .author import compile_rung, compile_logic
     for rung in rungs:
-        if not isinstance(rung, dict) or set(rung) - {"out", "logic", "preset", "comment"}:
-            raise GxwError("SFC 回路含未知字段；支持 out、logic、preset、comment")
-        parse_device(rung.get("out"))
+        if not isinstance(rung, dict) or set(rung) - {"out", "operands", "logic", "preset", "comment", "instruction"}:
+            raise GxwError("SFC 回路含未知字段")
+        compile_rung(rung)
     logic = [r["logic"] for r in rungs if r.get("logic") is not None]
+    if "reset" in spec:
+        logic.append(spec["reset"])
     logic += [e["when"] for s in spec["steps"] for e in s.get("transitions", [])]
     while logic:
         value = logic.pop()
@@ -158,6 +162,8 @@ def layout_sfc(spec: dict) -> dict:
                 logic.extend(children)
             elif key in {"not", "rise", "fall"} and isinstance(children, str):
                 parse_device(children)
+            elif key == 'compare':
+                compile_logic(value)
             else:
                 raise GxwError("SFC 条件仅支持软元件和 and/or/not/rise/fall")
         else:

@@ -1,12 +1,7 @@
-"""Logic-block construction for IL programs: contacts, ANB/ORB joins, MPS/MRD/MPP stacks.
+"""按块栈还原 MELSEC IL 条件与输出。
 
-The classic MELSEC IL model keeps three pieces of state while scanning instructions:
-the current block being built from LD/AND/OR contacts, the pending block that is the
-left-hand side of a forthcoming ANB/ORB join, and an MPS/MRD/MPP memory stack for
-branching rungs.
-
-This module turns IL into Rung objects without judging whether the program makes sense;
-validate.validate_program reports structural problems.
+LD/AND/OR 构建当前条件，ANB/ORB 从待合并栈取回左侧条件；
+MPS/MRD/MPP 使用独立的分支记忆栈。结构问题交由校验器报告。
 """
 
 from __future__ import annotations
@@ -20,6 +15,8 @@ from .il import (
     CONTACT_START,
     Instruction,
     Program,
+    COMPARISON_CONTACTS,
+    STRUCTURAL,
 )
 
 
@@ -34,6 +31,7 @@ class Contact:
     device: str
     negated: bool = False
     edge: str | None = None
+    bits: int = 16
 
     def __str__(self) -> str:
         prefix = "!" if self.negated else ""
@@ -78,6 +76,11 @@ def contact_for(instruction: Instruction) -> Contact:
     """Build a Contact from an LD/AND/OR-family instruction."""
 
     mnemonic = instruction.mnemonic
+    if mnemonic in COMPARISON_CONTACTS:
+        import re
+        op = re.search(r'[<>=]+$',mnemonic).group()
+        return Contact(device=f'{instruction.operands[0]} {op} {instruction.operands[1]}',
+                       bits=32 if mnemonic.startswith(('LDD','ANDD','ORD')) else 16)
     negated = mnemonic in {"LDI", "ANI", "ORI"}
     edge = None
     if mnemonic in {"LDP", "ANDP", "ORP"}:
@@ -126,14 +129,15 @@ class _State:
 
     def __init__(self) -> None:
         self.block: Node | None = None
-        self.saved: Node | None = None
+        self.saved: list[Node] = []
         self.mem: list[Node | None] = []
         self.invert_next = False
         self.step = 0
         self.start = 0
+        self.emitted = False
 
 
-def build_rungs(program: Program) -> list[Rung]:
+def build_rungs(program: Program, *, max_blocks: int | None = None) -> list[Rung]:
     """Pair every output / standalone instruction with the logic that reaches it."""
 
     state = _State()
@@ -148,15 +152,21 @@ def build_rungs(program: Program) -> list[Rung]:
         return node
 
     def close() -> None:
+        if state.saved:
+            raise LogicError(f"{instruction.mnemonic} at step {state.step} with unjoined blocks")
         rungs.append(
             Rung(
-                logic=intersect(active_step, state.block) if state.block is not None else active_step,
+                logic=(intersect(active_step, state.block) if state.block is not None else active_step)
+                if instruction.mnemonic not in STRUCTURAL else None,
                 instruction=instruction,
                 steps=(state.start, state.step - 1),
             )
         )
-        state.block = None
-        state.saved = None
+        # OUT 后可继续级联接点；下一条独立 LD 才另起条件。
+        state.emitted = instruction.mnemonic not in STRUCTURAL
+        if not state.emitted:
+            state.block = None
+        state.saved.clear()
         state.invert_next = False
         state.start = state.step
         # An MPS that was never closed belongs to the rung that just ended.
@@ -165,31 +175,35 @@ def build_rungs(program: Program) -> list[Rung]:
 
     for instruction in program.instructions:
         mnemonic = instruction.mnemonic
+        after_output = state.emitted
+        state.emitted = False
         state.step += 1
         if mnemonic == "STL":
+            if state.saved:
+                raise LogicError(f"STL at step {state.step} with unjoined blocks")
             active_step = Contact(device=instruction.operands[0])
-            state.block = state.saved = None
+            state.block = None
         elif mnemonic == "RET":
             active_step = None
             close()
         elif mnemonic in CONTACT_START:
-            if state.block is not None and state.saved is None:
-                state.saved = state.block
+            if state.block is not None and not after_output:
+                if max_blocks is not None and len(state.saved) + 2 > max_blocks:
+                    raise LogicError(f"LD block depth exceeds {max_blocks} at step {state.step}")
+                state.saved.append(state.block)
             state.block = take_contact()
         elif mnemonic in CONTACT_SERIES:
             state.block = intersect(state.block, take_contact())
         elif mnemonic in CONTACT_PARALLEL:
             state.block = unite(state.block, take_contact())
         elif mnemonic == "ANB":
-            if state.saved is None or state.block is None:
+            if not state.saved or state.block is None:
                 raise LogicError("ANB at step " + str(state.step) + " without two blocks")
-            state.block = Series((state.saved, state.block))
-            state.saved = None
+            state.block = Series((state.saved.pop(), state.block))
         elif mnemonic == "ORB":
-            if state.saved is None or state.block is None:
+            if not state.saved or state.block is None:
                 raise LogicError("ORB at step " + str(state.step) + " without two blocks")
-            state.block = Parallel((state.saved, state.block))
-            state.saved = None
+            state.block = Parallel((state.saved.pop(), state.block))
         elif mnemonic == "MPS":
             state.mem.append(state.block)
         elif mnemonic == "MRD":
@@ -215,7 +229,7 @@ def build_rungs(program: Program) -> list[Rung]:
                 steps=(state.start, state.step),
             )
         )
-    elif state.block is not None or state.saved is not None:
+    elif (state.block is not None or state.saved) and not state.emitted:
         rungs.append(
             Rung(
                 logic=state.block,

@@ -1,353 +1,214 @@
-# gxworks2-mcp
+# GX Works2 MCP
 
-MCP 服务器：让 AI 编写 **FX3U 梯形图与 SFC 步进程序，直接输出原生 `.gxw`**。
-独立目录为 `E:\trae_projects\gxworks2-mcp`。原生写入不启动 GX Works2，不调用
-computer use、鼠标、键盘、截图或浏览器；软件打开、编译、实体 PLC 验证分别验收。
+**让 AI 把三菱 PLC 程序写进工程，并带着验证结果交付。**
 
-第二轮优化将中间封装移入内存，并保留最终落盘读回和逐流核验。
-同输入交替基准：梯形图 466→167 ms，SFC 步进程序 439→163 ms。
-范围、测量方法及完整结果见 `docs/第二轮优化验证.md`。
+[![MIT License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
+[![Windows native](https://img.shields.io/badge/Native-Windows-0078D4)](#支持范围)
+[![MCP stdio](https://img.shields.io/badge/MCP-stdio-7C3AED)](#接入-ai-客户端)
+[![GX Works2 verified](https://img.shields.io/badge/GX_Works2-1.620_verified-00875A)](docs/原生SFC_1620验证.md)
+[![Multi-Agent](https://img.shields.io/badge/Multi--Agent-Collaboration-0E7490)](#多-agent-协作)
+[![Local validation](https://img.shields.io/badge/Local_tests-582_passed_%2F_44_skipped-00875A)](docs/公开版验收.md)
 
-> 定位：**给 AI 一个「写三菱 PLC 程序」的可校验管道**——把结构化逻辑树编译成 MELSEC 助记符程序，
-> 做静态校验，编码为原生程序流，写入新的 `.gxw`；自动读回源码并校验其他数据流不变。
->
-> ⚠️ 一个必须说清的事实：**GX Works2 的官方编程语言只有 梯形图 / 结构化梯形图·FBD / SFC / ST，
-> 没有 IL**（它声明符合 IEC 61131-3，但只实现了其中 4 种）。所以 IL 不是 GX Works2 的源语言，
-> 只是它「回路块列表显示/编辑」与「写入至 CSV 文件」的**呈现形式**。本工具产出的 IL/CSV 需要经由
-> 这两条通道也能带进 GX Works2。新的 `gx_write_project` 直接写二进制源码，不经过 CSV 导入。
+面向 **GX Works2 / MELSEC** 的开源 MCP（Model Context Protocol）服务器，覆盖梯形图与 SFC 编写、原生 `.gxw` 读写、GX Simulator2 批量验收、不动作诊断、改动影响分析及调试资料交接。
 
-## 快速编写与顺启逆停示例
+核心链路已在 **Windows + GX Works2 1.620 + FX3U/FX3UC** 的限定环境验证。AI 负责理解工艺和编写逻辑，MCP 负责确定性操作、检查与证据留存。第三方独立项目，与三菱电机无隶属关系。
 
-```python
-gx_program_create(name="motor", cpu="FX3U", rungs=[{"out": "Y0", "logic": "X10"}])
-gx_program_validate(name="motor")
-gx_write_project(name="motor", path=r"E:\工程序列\motor.gxw", confirm=True)
-gx_gxw_open(path=r"E:\工程序列\motor.gxw")
-```
+[快速开始](#快速开始) · [多 Agent 协作](#多-agent-协作) · [工具导航](#工具导航) · [验证结果](docs/公开版验收.md) · [支持范围](#支持范围)
 
-输出目录须存在，文件须为新文件；工具不会覆盖模板或已有工程。默认使用附带的 FX3U
-空白梯形图模板。已有工程需是已验证的简单梯形图源码格式，可显式指定 `template_path`
-和完整 `block` 名称。只修改该源码流及对应历史元数据，其他所有数据流逐字节核验。
-`requiresCompile=true` 表示生成的是原生源码，必须在 GX Works2 编译后才能用于下载。
+## 为什么值得用
 
-`examples/fx3u_sequence.py` 提供完整三路顺启逆停示例：X0 上升沿启动、X1 停止优先；
-Y0→Y1→Y2，每段 1 秒；逆停从最后已启动的一路开始立即关闭，再每隔 1 秒关闭下一路。
-启动途中可停止，停止过程中忽略启动，持续按住启动不会在停止后自动重启。
+| 亮点 | 能帮工程人员做什么 |
+|---|---|
+| **原生工程输出** | 梯形图直接写入新的 `.gxw`；原生 SFC 图形一次完成生成、编译、程序检查、保存和读回，减少界面录入 |
+| **真实模拟器验收** | 在 GX Simulator2 中模拟按钮与传感器输入，检查输出、步骤、定时/计数、响应窗口和持续保持 |
+| **后台验证流程** | 既有验收入口在独立 Windows 桌面运行 GX，保护前台窗口，不发送全局鼠标键盘操作 |
+| **看懂“不动作”** | 按实际程序追踪未满足的常开/常闭、分支、步骤及 16/32 位整数比较条件，列出缺失采样 |
+| **看清“改了影响谁”** | 比较前后版本，追踪输出、步骤、定时器、计数器和连续字依赖，给出复测建议 |
+| **多 Agent 协作** | 编写、审查和测试可以分工；工程锁、指令 ID 与版本校验为协作提供基础 |
+| **交付有据可查** | 导出程序、I/O、注释、置复位清单、匹配版本证据和 SHA256；交接前再次核验资料及版本 |
+| **按需加载工程技能** | 内置三菱地址规划、模式/报警审查、工艺场景测试三个技能，避免每道题重复整理规则 |
+
+### 快，来自减少重复工作
+
+- 一次提交完整逻辑，保持 MCP 会话；批量准备与批量验收减少逐条调用。
+- 原生 SFC 写入自带编译和读回；工程未变且哈希一致时可复用已有原生结果。
+- 回归、后台仿真和打包核对已有统一入口，失败会停止并保留阶段诊断。
+- 同输入基准中，普通梯形图源码写入中位耗时 **466 → 167 ms**，STL 顺控 **439 → 163 ms**。这是文件写入函数的历史实测，不包含模型编写或 GX 编译时间。[测量方法](docs/第二轮优化验证.md)
+
+## 快速开始
+
+需要 Python 3.10+。原生工程写入、原生编译和模拟器功能需要 Windows；原生 SFC 编译和仿真还需要自行合法安装兼容版本的 GX Works2。
 
 ```powershell
-py examples/fx3u_sequence.py E:\工程序列\顺启逆停
+git clone https://github.com/Links2008/gxworks2-mcp.git
+cd gxworks2-mcp
+py -m venv .venv
+./.venv/Scripts/python.exe -m pip install -e ".[native,ui,dev]"
+./.venv/Scripts/python.exe -X utf8 -m gxworks2_mcp
 ```
 
-生成普通梯形图与 STL/RET 顺控两份 `.gxw`、对应 `.il` 和步骤 JSON。
-测试包含独立扫描执行器的时序与边界检查；执行器仅覆盖示例使用的基本指令及 T0..T3，
-不等于实体 PLC 或完整 GX Simulator2。软件验收边界见 `docs/原生写入与验证.md`。
+最后一行启动 stdio MCP 服务，通常应由 AI 客户端启动。只使用离线编写、分析和 CSV 导出时，可安装 `pip install -e .`；开发测试增加 `.[dev]`。原生写入无需启用界面自动化。
 
-## 它解决什么问题
+### 接入 AI 客户端
 
-工程文件 `.gxw` 是二进制复合文档，目前提供以下通路：
+支持标准 **stdio MCP** 接入。下面以采用 `mcpServers` 配置结构的客户端为例；将路径替换为本机实际路径，其他客户端使用其对应的 MCP 配置入口。
 
-0. **原生源码写入（默认）**：FX3U 梯形图或结构化顺控 → 校验 → 编码 → IStorage 封装 →
-   源码与非目标流读回校验。不依赖 GX Works2 是否运行；Windows 需要 pywin32。
+```json
+{
+  "mcpServers": {
+    "gxworks2": {
+      "command": "C:/tools/gxworks2-mcp/.venv/Scripts/python.exe",
+      "args": ["-X", "utf8", "-m", "gxworks2_mcp"],
+      "env": {
+        "GXWORKS2_MCP_HOME": "C:/plc/mcp-workspace",
+        "PYTHONIOENCODING": "utf-8"
+      }
+    }
+  }
+}
+```
 
-1. **文本/CSV 路线（写程序）**：GX Works2 有两条「助记符形态」的官方通道——
-   「回路块列表显示/编辑」（Ver.1.86Q+）与「写入至 CSV 文件」（7 列、UTF-16 LE、Tab 分隔）。
-   本服务器把「结构化逻辑树 → MELSEC 助记符程序 → 静态校验 → CSV」这条链做完整，并把
-   **CSV → GX Works2 的导入做成了可自动化的已验证通路**（gx_import_csv，UIA expand()/invoke()，
-   无需鼠标/前台焦点，用标题栏步数变化验证生效）。
-3. **无软件直读 .gxw（新主线）**：gx_gxw_inventory / gx_gxw_open / gx_gxw_comments 用纯
-   Python（olefile）直接打开 .gxw——外层 OLE2 + 内嵌 _hdb OLE2 + diffgram XML 数据清单
-   （iID==内层流号，MAIN.res/POU/任务/参数全部定位），Q 系列的 MAIN.res 程序体已能解码回 IL
-   （语法经「写入→保存→读回」闭环逐字节对撞验证，见 re-evidence/GRAMMAR.md；
-   未知构造一律停止并报 stopReason，绝不编造指令）；
-   简单梯形图源码和部分网络记录可解码；任何不完整网络均返回 stopReason 和 partialIl，
-   不会被物化成可覆盖原工程的完整源码。FX3U 原生 SFC 图形使用 `gx_sfc_read` 完整读取。
-2. **MC 协议路线（连 PLC）**：QnA 兼容 3E 帧，字节序/设备码/位打包已与参考实现逐字节比对，
-   并已按三菱官方手册 SH-080008 校验。直接读写软元件、远程 RUN/STOP/PAUSE/latch clear。
+安装采用 editable 模式，升级代码后重新连接 MCP 服务以加载新工具。原生 SFC 可通过 `GXWORKS2_INSTALL_ROOT` 或工具参数指定 GX Works2 安装根目录。
 
-第 1 条**不依赖 GX Works2 是否安装**；第 2 条只需要 PLC 的网络端口。
+## 从编写到验收
 
-## SFC（顺控程序）支持
+以下是 **MCP 工具调用示意**，由客户端发送，不是可以直接独立运行的 Python 脚本。
 
-### 原生 SFC 图形：本机 1.620 已验证
-
-`gx_sfc_write` 一次完成图形创建、步骤动作和条件注册、原生整工程转换、完整程序检查、
-保存导出，以及磁盘读回。使用安装的 GX Works2 1.620.0.1 原生接口和 FX 14.67 转换器，
-不启动 GD2，不调用 computer use、鼠标、键盘、截图或 UI Automation。
-同一时间最多一个按需 x86 辅助进程，完成或失败后退出；不连接 PLC。
+### 1. 批量准备梯形图
 
 ```python
-from examples.fx3u_sequence import native_sequence_spec
-
-gx_sfc_write(
-    spec=native_sequence_spec(),
-    path=r"E:\工程序列\顺启逆停_原生SFC.gxw",
-    template_path=r"E:\工程序列\FX3U_SFC模板.gxw",
-    installation_root=r"D:\新建文件夹",
-    confirm=True,
+gx_program_prepare(
+    name="motor", cpu="FX3U",
+    rungs=[{"out": "Y0", "logic": {"and": ["X0", {"not": "X1"}]}}]
 )
-gx_sfc_read(path=r"E:\工程序列\顺启逆停_原生SFC.gxw")
+gx_program_read(name="motor")
+gx_write_project(name="motor", path="C:/plc/motor.gxw", confirm=True)
 ```
 
-模板目前须为 `Block.Program.pou` 图形、`Block1.Program.pou` 连续扫描块及 `MAIN.res`
-组成的 FX3U/FX3UC 工程。`spec` 使用 `initial/preamble/steps`，步骤包含
-`state/actions/transitions`。支持顺序、双路选择和显式跳转；暂不支持并行分支及任意模板布局。
-输出须为新文件；未知原生版本、未知数据流变化、编译错误或读回差异均阻止发布。
-安装目录可省略，由本机注册信息或 `GXWORKS2_INSTALL_ROOT` 取得。
+输出目录须存在，输出文件须为新文件。普通梯形图源码写入返回 `requiresCompile=true` 时，仍须在 GX Works2 编译。助记符 IL 是本工具的中间表示，不宣称为 GX Works2 独立支持的源语言。
 
-该示例为 6 步、8 转移、1 秒间隔。输出集中驱动，避免重复线圈；首次扫描清理旧步骤，
-同时按启停不产生延迟启动，持续按住启动不自动重启。完整编译检查实测约 6.6 秒；
-纯文件 `gx_sfc_read` 约 12 毫秒，不启动任何辅助进程。每次写入返回独立阶段耗时和原生诊断。
-原生编译及读回通过与实体 PLC 验证是不同的验收层；本项目没有自动下载或驱动实体设备。
+### 2. 原生 SFC 图形与编译
 
-### 指令表与结构预览
+`gx_sfc_write(spec, path, template_path, installation_root, confirm=True)` 接受 `initial / preamble / steps` 结构；步骤包含 `state / actions / transitions`。
 
-GX Works2 的 FX 系列顺控程序在指令表里就是 **STL 步进梯形**（`STL S0 … RET`），
-本服务器全链路支持：
+- 一次执行图形创建、动作与条件注册、整工程转换、程序检查、保存和磁盘读回。
+- 输出新的 `.gxw`，拒绝覆盖模板；未知库版本、编译错误或读回差异会阻止发布。
+- 目前要求兼容的双块 FX3U/FX3UC SFC 模板；支持顺序、双路选择和显式跳转。
+- 参考 [顺启逆停](examples/fx3u_sequence.py)、[机械手 SFC](examples/fx3u_handling_sfc.py) 和 [钻孔工位](examples/fx3u_drilling.py)。[原生 SFC 说明](docs/原生SFC_1620验证.md)
 
-- `gx_program_create(name, cpu, il='STL S0\nOUT Y10\nLD X10\nOUT S8\nRET\n…\nEND')`
-- 支持 `sfc={initial, preamble, steps:[{state, actions, transitions}]}` 结构化生成。
-- 定时器动作使用 `{out:"T0", preset:"K10"}`；条件复用梯形图 and/or/not/rise/fall。
-- 校验（gx_program_validate）→ 原生写入（gx_write_project）→ 源码读回（gx_gxw_open）
-- 从 .gxw 解码回来的顺控程序、以及新建的顺控程序，都能用
-  gx_where_used / gx_trace_device（转移条件追踪）/ gx_lint_program 分析
+### 3. GX Simulator2 批量验收
 
-`gx_sfc_preview` 保留远端已有的只读结构预览，始终返回 `runnable=false`，其表结构与
-原生写入的 `spec` 不同。指令表源码导出的文件仍需编译；原生图形闭环见
-`docs/原生SFC_1620验证.md`，记录格式见 `re-evidence/GRAMMAR.md`。
+先在 GX Works2 加载已编译的测试工程，再通过模拟器工具启动、读写虚拟输入和验证动作。下面的期望仅适用于上面的 `motor` 逻辑，不能直接套用到其他工艺。
 
-## 安装
-
-### AI 批量写入的快速路径
-
-优先调用 `gx_program_prepare(name, cpu, rungs=[...])`，一次传入全部梯级；
-或用 `il="..."` 传完整指令表。FX 顺控使用已有的 `STL ... RET ... END`
-表示，不等同于 GX Works2 原生图形 SFC 编辑器。
-
-这一个调用完成生成、静态校验、保存及 CSV 导出，默认只返回摘要、全部校验消息和
-CSV 路径，不重复回显整个 IL/ASCII。需要预览时传 `preview=true`，或之后调用
-`gx_program_read`。校验错误会阻止写入；替换现有本地工程需 `overwrite=true`。
-`cpu` 必填，CSV 使用该 CPU 标签；需要精确机型描述时传 `cpu_label`。
-
-不要逐条调用 `gx_program_add_rungs`，也不要为每次调用重新启动 MCP 服务。
-保持同一个 stdio 会话。批量准备不会操作桌面或 PLC；CSV 导入仍单独调用
-`gx_import_csv(confirm=true)`，并在导入后编译、检查。详情与可重复基准见
-[docs/PERFORMANCE.md](docs/PERFORMANCE.md)。
-
-增量修改用 `gx_program_slice` 读取稳定指令 ID 与版本，再用 `gx_program_patch`
-批量修改并刷新 CSV；旧版本拒绝写入。`gx_sfc_preview` 提供步骤表结构检查，
-但始终返回 `runnable=false`，尚不是 SFC 编译器。导入后可调用
-`gx_verify_import` 通过新导出 CSV 核对内容；仅提供一个 CSV 文件时只做离线比较，
-不会冒称实机导入验证。详见 [docs/EDIT_AND_VERIFY.md](docs/EDIT_AND_VERIFY.md)。
-
-需要 Python 3.10+。
-
-```bash
-cd gxworks2-mcp
-py -m pip install -e ".[native,dev]"     # Windows 原生写入与测试
-# 界面自动化只在明确需要时安装 .[ui]，原生写入不需要它
+```python
+gx_simulator_start(confirm=True)
+gx_simulator_control(action="run", confirm=True)
+gx_simulator_verify(steps=[
+    {"inputs": {"X0": 0, "X1": 0}, "expect": {"Y0": 0}},
+    {"inputs": {"X0": 1}, "expect": {"Y0": 1}, "hold_ms": 200},
+    {"inputs": {"X1": 1}, "expect": {"Y0": 0}}
+], confirm=True, project_name="motor")
+gx_simulator_control(action="stop", confirm=True)
+gx_simulator_stop(confirm=True)
 ```
 
-验证：
+支持批量输入、响应时间、持续保持和采样禁止组合。只写虚拟 X 输入，读取 X/Y/M/S/T/TN/D/C/CN；未知引擎哈希、多实例或读回失败会拒绝操作。`project_name` 绑定工作区版本，不自动认证模拟器实际装载代码。[模拟器说明](docs/GX_SIMULATOR2.md)
 
-```bash
-py -m pytest -q                          # 离线测试，不需要 PLC / GX Works2
-py tests/test_stdio_e2e.py              # 真实 MCP 握手、梯形图/SFC 原生写入与读回
+需要不打扰前台时，使用 [统一后台验收入口](docs/通用编写与验收.md#一次调用的完整验收)。普通桌面工具仍可能作用于当前 GX 工程，不应让多个 Agent 同时操作 GUI。
+
+### 4. 诊断、改动评估与交接
+
+```python
+gx_diagnose_output(name="motor", device="Y0",
+                  snapshot={"X0": 1, "X1": 1, "Y0": 0, "M8000": 1})
+gx_change_impact(before_name="motor_before", after_name="motor_after")
+gx_handover_export(name="motor")
+gx_handover_verify(path="C:/plc/资料包.zip", name="motor")
 ```
 
-## 接入 DSH（DeepSeek Harness）
+前后版本与 ZIP 路径须替换为真实已保存对象。诊断可使用提供的快照完全离线运行；省略快照时只读现有模拟器。复杂控制流、缺失数据与锁存历史会保留未知，不把猜测当成故障结论。
 
-DSH 用 @deepseek-ai/dsh-mcp-client 桥接外部 MCP 服务器，每台服务器一条配置项，
-工具以 mcp__<serverName>__<tool> 命名。把下面这段加到 DSH 的配置层
-（~/.dsh/cordis.patch.yml，或你的 profile 的 cordis.patch.yml）：
+## 多 Agent 协作
 
-```yaml
-- id: mcp-gxworks2
-  name: '@deepseek-ai/dsh-mcp-client'
-  config:
-    serverName: gxworks2
-    transport: stdio
-    command: py
-    args: ['-m', 'gxworks2_mcp']
-    cwd: E:/trae_projects/gxworks2-mcp
-    env:
-      PYTHONPATH: E:/trae_projects/gxworks2-mcp/src
-      PYTHONIOENCODING: utf-8
-      GXWORKS2_MCP_HOME: E:/trae_projects/gxworks2-mcp/.mcp-cache
-    toolCallTimeoutMs: 120000
-```
+项目提供 **多 Agent 可共用的工程工具与并发保护**，Agent 的创建、消息和任务调度由宿主客户端负责。
 
-重启 DSH 后，模型就能看到 mcp__gxworks2__gx_program_create 等工具。
-
-> 注意：command 用绝对路径的 python 更稳（py 是启动器）。插件配置请写在 profile 的
-> cordis.patch.yml，不要写进安装目录。
-
-## 工具一览
-
-### 写程序（核心）
-
-| 工具 | 作用 |
+| 分工 | 推荐职责 |
 |---|---|
-| gx_program_create | 建工程 + 用「逻辑树」或 IL 初始化程序 |
-| gx_write_project | 无窗口直接输出新的 FX3U `.gxw`，自动读回并逐流校验 |
-| gx_program_add_rungs | 追加梯形图行（逻辑树自动编译成 IL） |
-| gx_program_replace | 用整段 IL 覆盖程序，返回 diff 与校验结果 |
-| gx_program_read | 读回 IL / ASCII 梯形图 / 布尔逻辑 / 结构 |
-| gx_program_validate | 结构+软元件校验（线圈重复、ANB/ORB 不配对、越界、跳转缺标号…） |
-| gx_program_export | 导出可直接粘贴的 IL、ASCII 梯形图或 JSON |
-| gx_program_import_csv | 读入 GX Works2 导出的程序 CSV（CSV → IL，不是 CSV → 梯形图） |
-| gx_gxw_inventory | **无软件直读 .gxw**：容器/内层流/数据文件清单（iID→流号），程序正文记录锚点 |
-| gx_gxw_open | 深读 .gxw + 物化为 store 工程（raw.bin + gxw_manifest.json，程序体解码进度如实上报） |
-| gx_gxw_comments | 从 .gxw 提取 label 表注释（COMMENT.qcd 为带口令 Jet DB，诚实标注未解） |
-| gx_program_export_csv | 输出 GX Works2 形状的程序 CSV（UTF-16 LE / Tab / 7 列） |
-| gx_project_list / gx_device_usage / gx_device_describe | 工程列表、软元件引用清单、地址解释 |
-| gx_where_used | 交叉引用：每个软元件在哪被写/被读（分析思路取自 gx3-cli-mcp） |
-| gx_trace_device | 「这个线圈为什么/怎么才能 ON」：递归展开到 X/边界输入，环与深度显式报告 |
-| gx_lint_program | 静态审查：多线圈驱动、只写不读的死逻辑 |
+| 编写 Agent | 在独立命名的工程中生成梯形图/SFC，提交完整逻辑与工艺假设 |
+| 审查 Agent | 读取程序，检查地址、模式切换、置复位和改动影响 |
+| 验收 Agent | 按工艺设计正常、异常和恢复场景，集中执行编译与仿真 |
+| 交付 Agent | 归档同版本证据、导出资料并核对最终代码版本 |
 
-### 送进 GX Works2（可选，Windows）
+**协作保护已落到代码和测试：**
 
-| 工具 | 作用 |
+- 同工程合作写入使用可重入线程锁与操作系统文件锁，覆盖遵守该锁的多个 MCP 进程。
+- `gx_program_slice` 返回指令 ID 和版本；`gx_program_patch` 要求 `expected_version`，旧版本补丁会被拒绝。
+- 原生 SFC 在同一工作区内串行使用编译辅助进程；模拟器应交给单一调度者，跨服务进程不提供全局仿真事务。
+- 证据缓存属于各自 MCP 进程。需要统一交付时，让诊断、具名验收和导出在同一持久服务会话执行。
+
+推荐 **独立工程并行编写与审查 → 选定版本 → 串行编译与仿真 → 同会话归档**。外部编辑器绕过锁、进程中断时的多文件崩溃原子性不在锁保证范围内。[锁与补丁测试](tests/test_patching.py)
+
+## 工具导航
+
+| 场景 | 主要工具 |
 |---|---|
-| gx_workspace_status | GX Works2 是否运行、UI 自动化是否可用 |
-| gx_import_csv | **已实测通路**：UIA 驱动 编辑→「从CSV文件读取」，导入 CSV 重建梯形图（无需鼠标/前台焦点；需 confirm=true，整块替换） |
-| gx_compile_csv | UIA 触发 转换/编译（F4） |
-| gx_paste_ladder | 遗留：剪贴板粘贴 IL —— 1.620W 实测**无效**，保留仅供参考 |
-| gx_save_project | Ctrl+S |
-| gx_open_project | 打开 .gxw |
+| 编写与增量修改 | `gx_program_prepare`、`gx_program_create`、`gx_program_read`、`gx_program_slice`、`gx_program_patch` |
+| 原生工程 | `gx_write_project`、`gx_sfc_write`、`gx_sfc_read`、`gx_gxw_inventory`、`gx_gxw_open`、`gx_gxw_comments` |
+| 逻辑检查 | `gx_program_validate`、`gx_where_used`、`gx_trace_device`、`gx_lint_program` |
+| 调试与改动评估 | `gx_diagnose_output`、`gx_change_impact` |
+| 虚拟 CPU | `gx_simulator_start`、`gx_simulator_status`、`gx_simulator_control`、`gx_simulator_read`、`gx_simulator_inputs`、`gx_simulator_press`、`gx_simulator_verify`、`gx_simulator_stop` |
+| 交付资料 | `gx_handover_export`、`gx_handover_verify` |
+| 工程技能 | `gx_skill_list`、`gx_skill_read` |
+| CSV 与可选 UI 通路 | `gx_program_export_csv`、`gx_program_import_csv`、`gx_import_csv`、`gx_compile_csv`、`gx_verify_import` |
+| 独立 MC 协议通路 | `plc_probe`、`plc_read`、`plc_write`、`plc_remote_control` |
 
-### 直连 PLC / 模拟器（MC 协议 3E 帧）
+MCP 是 AI 工具协议，MC 是三菱设备通信协议。模拟器工具与实体 PLC 通路分开；MC 写入需显式确认及写入授权，不是自动下载工作流。
 
-| 工具 | 作用 |
+## 验证与开发
+
+最近完整验收：**2026-10-23，626 项测试中 582 通过、44 项环境门控跳过；53 次真实 MCP 调用完成。** 包含正常动作、异常/恢复、16 种连续输出组合、14 步模式测试，以及交付包同版通过/异版拒绝。
+
+完整自动流程（全量回归 + 后台仿真 + 打包核对）本机实测 **66.644 秒**，不包含新功能编写时间。后台验收未切换桌面，前后前台窗口句柄一致，模拟器已退出。徽章是带日期的本机验收快照，不是持续集成状态。[结果与复现边界](docs/公开版验收.md)
+
+```powershell
+py -X utf8 -m pytest
+# 原生/现场集成用例按环境变量启用，缺少对应环境时会明确跳过。
+```
+
+具备已核验工程与原生报告时，在项目根目录运行完整后台流程（含打包需 Python 3.11+）：
+
+```powershell
+py -X utf8 -m tools.run_verification <工程绝对路径> <原生核验JSON绝对路径> <新输出目录> --package
+```
+
+源码包含 Python 服务、C# 原生适配源码、测试、工艺示例及文档。GX Works2 安装程序和专有 DLL 不随仓库分发。
+
+## 支持范围
+
+| 能力 | 当前边界 |
 |---|---|
-| plc_probe | 探测 host:port 是否是 MC 协议端点 |
-| plc_read | 读 D/M/X/Y/T/C/ZR 等（支持 D100-D109, M0-M15） |
-| plc_write | 写软元件（需 allow_write=true） |
-| plc_remote_control | 远程 RUN / STOP / PAUSE / LATCH CLEAR |
+| 离线编写与分析 | Python；主要验证 FX3U/FX3UC，部分 Q/L 解析和 MC 能力按各工具说明 |
+| 梯形图原生源码写入 | Windows + pywin32；简单梯形图/支持的 STL，生成后仍可能需要 GX 编译 |
+| 原生 SFC 编译 | GX Works2 **1.620.0.1 / FX 14.67**，库哈希匹配且使用兼容双块模板 |
+| GX Simulator2 | 已核验中文 1.620 的 FX 引擎；按可执行文件 SHA256 限定版本 |
+| SFC 图形 | 顺序、双路选择、显式跳转；暂不支持并行分支和任意模板布局 |
+| `.gxw` 读取 | 已知记录可解析；未知构造返回停止原因和部分结果，不伪造完整程序 |
+| 不动作诊断 | FX3U/FX3UC 的 Y/M 输出；布尔条件和支持的 16/32 位有符号整数比较 |
+| 实体 PLC | 独立 MC 通路存在；当前仿真与离线结果不等同于实体设备、接线或机械验收 |
 
-## 模型怎么用（示例）
+X/Y 使用 FX 八进制规则；取不到的值不补零。交付包不含原生 GXW 全工程，SHA256 校验不等于签字认证；现场信息和验收结论保留待填。
 
-> 「写一个三菱 Q 系列程序：X0 启动、X1 停止，Y0 自锁输出；X2 报警时 Y1 常亮。」
+## 文档与源码
 
-模型会这样调用：
+- [通用编写与验收](docs/通用编写与验收.md) / [GX Simulator2](docs/GX_SIMULATOR2.md)
+- [原生 SFC](docs/原生SFC_1620验证.md) / [工程技能](docs/工程技能.md)
+- [版本补丁与导入核验](docs/EDIT_AND_VERIFY.md) / [可靠性说明](docs/RELIABILITY.md)
+- [三菱与竞赛参考](docs/PLC竞赛与优秀案例参考_20261022.md) / [研究来源](docs/RESEARCH.md)
+- [服务源码](src/gxworks2_mcp) / [测试](tests) / [示例](examples) / [验证工具](tools)
 
-```json
-{"name": "gx_program_create",
- "arguments": {
-   "name": "line1",
-   "cpu": "Q",
-   "rungs": [
-     {"out": "Y0", "comment": "电机自锁",
-      "logic": {"or": [{"and": ["X0", {"not": "X1"}]}, {"and": ["Y0", {"not": "X1"}]}]}},
-     {"out": "Y1", "comment": "报警灯", "logic": {"and": ["X2", {"not": "X1"}]}}
-   ]}}
-```
+历史技术记录按各文档日期理解，当前支持范围以本页和对应工具的参数校验为准。
 
-得到：
+## 许可证与致谢
 
-```
-LD X0
-ANI X1
-LD Y0
-ANI X1
-ORB
-OUT Y0  // 电机自锁
-LD X2
-ANI X1
-OUT Y1  // 报警灯
-END
-```
-
-和 ASCII 预览：
-
-```
-|[X0]----[/X1]----(Y0)---|
-|[Y0]----[/X1]----(Y0)---|
-|~~~~----[END]
-```
-
-## 逻辑树语法
-
-```json
-{"and": ["X0", {"not": "X1"}, {"rise": "M0"}, {"fall": "M1"}]}
-{"or":  [{"and": ["X0", "X1"]}, {"and": ["X2", "X3"]}]}
-```
-
-- and / or 可嵌套；数组第一个元素生成 LD/LDI，后续元素生成 AND/ANI/ANDP/ANDF 或 OR/ORI/ORP/ORF；
-- 嵌套超过一层时自动插入 ANB/ORB 块连接；
-- 操作数：X0、{"not": "X1"}（常闭）、{"rise": "M0"}（上升沿）、{"fall": "M1"}（下降沿）。
-
-助记符严格按 MELSEC/GX Works2 写法：常闭与 = ANI（不是 ANDI），常闭或 = ORI，
-上升沿 = ANDP/ORP，下降沿 = ANDF/ORF。
-
-## 数据放在哪
-
-默认 ~/.gxworks2-mcp/projects/<工程名>/：
-
-```
-program.il      # 当前程序（指令表）
-program.json    # 结构快照：rungs、软元件、ASCII、校验结果
-devices.csv     # 软元件注释（可导入 GX Works2）
-```
-
-可用环境变量 GXWORKS2_MCP_HOME 改根目录。
-
-## 已知边界（重要）
-
-- **解析范围按程序体报告**：简单梯形图源码可完整读回；结构化网络和原生 SFC 图形遇到
-  未知结构立即停止，不把 partialIl 作为完整程序保存。应使用 `.Program.pou` 读取当前源码；
-  `.res` 可能是上次编译缓存，源代码修改后两者不一定一致。
-- **默认写入为无窗口 GXW 源码通路**：只创建新文件，拒绝覆盖；其他流逐字节核验。
-  编译缓存仍需由 GX Works2 更新。原生 SFC 图形画布的直接新建尚未实现。
-- **旧 CSV 通路保留为备选**：1.620W 实测 Ctrl+V 无效（gx_paste_ladder 遗留）。
-  gx_import_csv 驱动 编辑→「从CSV文件读取」：实测梯形图 2 步变 7 步、F4 编译无报错。
-  官方对话框明说导入是**整块替换**，一个 CSV = 一个完整程序块，confirm=true 才执行。
-- **CSV 导入是「实测可用」而非「官方承诺」**：官方 FAQ 只承诺设备注释 CSV 双向（1.64S+），
-  对程序 CSV 导入没有任何书面承诺——但 UI 与功能在本机 1.620W 中文版实测成立。列头按语言变化
-  （中文「步号/指令」，日文「ステップ番号/命令」），gx_program_export_csv 的 locale 参数控制。
-  导入后务必执行 程序检查（F4 + gx_program_validate 复核）。
-- **软元件限制**：MC 外部通信的 S 步进继电器写入被拒绝；PLC 程序内的 SET S/STL S 正常支持。
-  FX3U 原生源码的 X/Y 严格按八进制处理，X8、Y9 等直接报错；原 MC 客户端仍使用 Q/L 规则，
-  本轮未扩展 FX3U MC 寻址，不能拿它的 Q/L 数字解释直接驱动 FX3U。
-- **GX Simulator2 不能直连 MC 协议**（三菱 FAQ：需 MX Component；模拟器是隔离进程），
-  所以 plc_probe 对着模拟器端口连不上属于预期。
-- **远程 RUN 不可只看结束码**：三菱手册说明 CPU 的 RUN/STOP 物理开关在 STOP 时，
-  远程 RUN 仍返回正常完成。因此 plc_remote_control 在 run/stop 后会**回读 SM0** 确认状态。
-- **MC 协议写入**默认被拦截（allow_write=false），因为写错地址会真的动设备。
-- 设备代码表按 QnA 兼容 3E 帧整理；FX 系列走同一套代码，个别机型扩展区需按手册核对。
-- 未实现：在线监视、ST 生成、原生 SFC 图形画布新建、通用厂商编译器替代。
-  已实现 FX3U 简单梯形图和 STL/RET 顺控的原生源码写入。
-
-## 事实出处
-
-设计与协议细节都标注了来源，见 [docs/RESEARCH.md](docs/RESEARCH.md)（每条事实附 URL 与
-「确证 / 未证实」分级；依据 SH-080008、SH-080956 两本官方手册与多个官方 FAQ）与
-[docs/GXWORKS2_NOTES.md](docs/GXWORKS2_NOTES.md)（设计取舍）。
-
-MC 帧与设备码另有一份可重复的交叉验证脚本：
-
-```bash
-py -m pip install pymcprotocol      # 仅用于交叉验证，不是运行时依赖
-py tests/crosscheck_pymcprotocol.py # 逐字节比对帧 + 逐个比对设备码
-```
-
-## 开发
-
-```
-src/gxworks2_mcp/
-  devices.py     软元件解析 + MC 设备码
-  il.py          指令表解析/渲染
-  blocks.py      IL → 梯形图逻辑还原（ANB/ORB/MPS/MRD/MPP）
-  author.py      逻辑树 → IL 编译器
-  validate.py    程序校验
-  store.py       工程存储
-  mcprotocol.py  MC 协议 3E 帧客户端（小端，1 字节设备码）
-  csvio.py       GX Works2 程序 CSV / 设备注释 CSV 读写
-  ui.py          GX Works2 窗口自动化（可选）
-  compat.py      MCP SDK 1.x / 2.x 兼容层
-  server.py      MCP 工具定义
-tests/           离线回归、顺控扫描时序、原生 GXW 写入与 stdio 端到端验证
-```
-
-## License
-
-MIT
+本项目代码采用 [MIT License](LICENSE)。复用的数据表与参考资料分别遵守其原许可证，详见 [第三方资料归属](third-party/README.md) 与 [NetToGXSim2 参考说明](third-party/NetToGXSim2-NOTICE.txt)。感谢相关开源项目提供的接口研究与公开资料。

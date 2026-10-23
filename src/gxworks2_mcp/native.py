@@ -34,17 +34,23 @@ def encode_program(program: Program, cpu: str = "FX3U", text_encoding: str = "ut
         if ins.mnemonic in {"SET", "RST"} and ins.operands[0].upper().startswith("S"):
             # 本机原生程序检查要求 S 步骤使用专用置位、复位编码。
             output.extend(bytes.fromhex("04230204" if ins.mnemonic == "SET" else "04240204"))
+        elif ins.mnemonic == "RST" and ins.operands[0].upper().startswith(("T", "C")):
+            output.extend(bytes.fromhex("04240304"))
         else:
             output.extend(min(choices, key=lambda item: len(item[0]))[0])
         for text in ins.operands:
             if re.fullmatch(r"K[+-]?\d+", text, re.I):
                 value = int(text[1:])
-                if not -32768 <= value <= 32767:
-                    raise GxwError("当前 K 常量写入范围为 -32768..32767")
-                value_bytes = bytes([value]) if 0 <= value <= 255 else struct.pack("<h", value)
+                bits = 32 if ins.mnemonic.startswith(('DMOV','DADD','DSUB','DMUL','DDIV','DCMP','LDD','ANDD','ORD')) else 16
+                if not -(1 << (bits-1)) <= value < (1 << (bits-1)):
+                    raise GxwError("K 常量超出指令位宽")
+                value_bytes = bytes([value]) if 0 <= value <= 255 else struct.pack('<h' if -32768 <= value <= 32767 else '<i',value)
                 code = 0xE8
             elif re.fullmatch(r"H[0-9A-F]+", text, re.I):
-                value_bytes = int(text[1:], 16).to_bytes(2, "little")
+                value = int(text[1:],16)
+                bits = 32 if ins.mnemonic.startswith(('DMOV','DADD','DSUB','DMUL','DDIV','DCMP','LDD','ANDD','ORD')) else 16
+                if value >= 1 << bits: raise GxwError('H 常量超出指令位宽')
+                value_bytes = value.to_bytes(2 if value <= 65535 else 4,'little')
                 code = 0xEA
             else:
                 ref = parse_device(text)

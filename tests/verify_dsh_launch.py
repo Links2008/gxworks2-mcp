@@ -11,13 +11,14 @@ import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-PYTHON = r"C:\Users\lenovo\AppData\Local\Programs\Python\Python313\python.exe"
-CWD = r"E:\trae_projects\Linkshub\gxworks2-mcp"
-HOME = r"E:\trae_projects\Linkshub\gxworks2-mcp\.mcp-cache"
+PYTHON = sys.executable
+CWD = str(Path(__file__).resolve().parents[1])
+HOME = os.environ.get("GXWORKS2_MCP_HOME", str(Path(CWD) / ".mcp-cache"))
 
 # DSH removes KEY/PASSWORD/SECRET/TOKEN names and every DSH_* name, then merges config env.
 CONFIG_ENV = {

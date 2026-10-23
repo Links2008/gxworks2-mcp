@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gxworks2-mcp"
 version = "0.1.0"
-description = "MCP server for Mitsubishi GX Works2 / MELSEC PLC programming: IL/ladder authoring, program analysis, MC protocol I/O, and optional GX Works2 UI automation."
+description = "MCP tools for Mitsubishi GX Works2: native ladder/SFC authoring, simulator verification, diagnostics, multi-agent collaboration and traceable handover."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -28,7 +28,7 @@ license-files = ["LICENSE", "third-party/*.txt", "third-party/README.md"]
 where = ["src"]
 
 [tool.setuptools.package-data]
-gxworks2_mcp = ["data/*.json", "data/*.gxw", "data/*.cs"]
+gxworks2_mcp = ["data/*.json", "data/*.gxw", "data/*.cs", "data/skills/*/SKILL.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
