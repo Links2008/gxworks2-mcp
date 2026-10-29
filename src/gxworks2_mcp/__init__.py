@@ -1,6 +1,6 @@
 """GX Works2 / MELSEC programming toolkit exposed as an MCP server."""
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from .blocks import (  # noqa: F401
     Contact,

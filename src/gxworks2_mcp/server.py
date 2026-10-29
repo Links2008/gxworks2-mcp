@@ -93,7 +93,9 @@ _INSTRUCTIONS = (
     "plc_write 写入前必须把主机、端口、软元件和数值告诉用户，并询问「现在写入吗？」。"
     "只有用户明确同意后，才可同时传 confirm=true 与 allow_write=true；不得自行确认。"
     "FX3U 原生 SFC 使用 gx_sfc_write：一次提交完整 spec，原生编译、检查、保存和读回；"
-    "gx_sfc_read 离线读取图形步骤、动作和条件，不启动原生进程。"
+    "读取已有SFC内部程序优先用gx_sfc_read；gx_gxw_open也按源码格式返回步骤、动作和条件。"
+    "topologyVerified=false时保留diagnostics中的多目标或未解析引用，不代表源码为空或可安全重建。"
+    "这些读取不启动原生进程，不连接PLC。"
     "简单梯形图可用 gx_write_project 写出源码，仍需另行编译。"
     "Author MELSEC ladder programs for GX Works2. Prefer gx_program_prepare: send ALL "
     "rungs in one batch, or complete IL (including FX STL/RET sequences), to validate, "
@@ -767,6 +769,19 @@ def _safe_name(text: str) -> str:
     return "".join(ch if (ch.isalnum() or ch in ".()-") else "_" for ch in text)
 
 
+def _decode_gxw_body(project, entry):
+    """按源码格式路由，SFC 子程序保持步骤绑定，禁止扁平化导入。"""
+    from .sfc_binary import is_sfc_source, read_sfc_block
+    body = project.read_stream(entry)
+    if entry.name.lower().endswith(".pou") and is_sfc_source(body):
+        if project.cpu != "FX3U/FX3UC":
+            raise GxwError("原生 SFC 读回目前核验 FX3U/FX3UC")
+        return dict(decoded=True, coverage=1.0, representation="native-sfc-graph",
+                    recommendedTool="gx_sfc_read", editable=False, runnable=False, **read_sfc_block(body))
+    decoder = pou_stream if entry.name.lower().endswith(".pou") else main_res_program
+    return decoder(body, cpu=project.cpu, text_encoding=project.text_encoding)
+
+
 @server.tool()
 def gx_gxw_inventory(path: str) -> str:
     """Read a .gxw without GX Works2: identity, inventory, per-program decode status.
@@ -777,7 +792,8 @@ def gx_gxw_inventory(path: str) -> str:
     parameters and libraries. Q-family MAIN.res bodies are decoded to IL with the
     grammar proven in re-evidence/GRAMMAR.md (verified byte-exact on a known
     round trip); anything unverified stops with a stopReason instead of guessing.
-    FX/other families still report framing only.
+    FX3U 原生 SFC 返回格式识别与图形诊断；完整动作、条件可用 gx_sfc_read 读取。
+    未支持的记录仍明确报告读取边界，不据此认定程序为空。
     """
 
     try:
@@ -788,17 +804,14 @@ def gx_gxw_inventory(path: str) -> str:
     structure = project.program_structure()
     for entry in structure:
         if entry.get("available") and entry.get("name", "").lower().endswith((".res", ".pou")):
-            body = project.read_stream(project.find(entry["name"]))
             try:
-                if entry["name"].lower().endswith(".pou"):
-                    decoded = pou_stream(body, cpu=project.cpu, text_encoding=project.text_encoding)
-                else:
-                    decoded = main_res_program(body, cpu=project.cpu, text_encoding=project.text_encoding)
+                decoded = _decode_gxw_body(project, project.find(entry["name"]))
             except GxwError as exc:
                 decoded = {"decoded": False, "error": str(exc)}
             entry["decode"] = {
                 k: decoded[k]
-                for k in ("decoded", "coverage", "il", "stopReason", "edgeFidelityContacts")
+                for k in ("decoded", "coverage", "il", "stopReason", "error", "edgeFidelityContacts",
+                          "representation", "recommendedTool", "topologyVerified", "diagnostics")
                 if k in decoded
             }
             if decoded.get("decoded"):
@@ -831,15 +844,14 @@ def gx_gxw_open(path: str, import_into: str = "", overwrite: bool = False, progr
     try:
         for entry in project.programs():
             try:
-                payload = project.read_stream(entry)
-                decoder = pou_stream if entry.name.lower().endswith(".pou") else main_res_program
-                attempt = decoder(payload, cpu=project.cpu, text_encoding=project.text_encoding)
+                attempt = _decode_gxw_body(project, entry)
             except GxwError as exc:
                 summary["decodedPrograms"].append({"name": entry.name, "decoded": False, "error": str(exc)})
                 continue
             summary["decodedPrograms"].append({"name": entry.name, "id": entry.iid, **attempt})
         complete = [p for p in summary["decodedPrograms"] if p.get("decoded") and p.get("coverage") == 1.0]
         summary["programBodiesDecoded"] = len(complete)
+        complete = [p for p in complete if "il" in p]
         summary["editable"] = bool(complete)
         if import_into:
             selected = [p for p in complete if p["name"] == program] if program else complete

@@ -471,6 +471,11 @@ def _fx_operators():
     return operators
 
 
+# 只扩展已观察源码的读取，不扩大 encode_program 的写入准入范围。
+_FX_READ_OPERATORS = {bytes.fromhex("04200204"): ("OUT", 1),
+                      bytes.fromhex("0563111d05"): ("DDRVA", 4)}
+
+
 def _fmt(name, radix, value, cpu=""):
     if cpu.upper().startswith("FX"):
         if name in ("X", "Y"):
@@ -480,6 +485,11 @@ def _fmt(name, radix, value, cpu=""):
 
 
 def _read_operator(stream, i, cpu=""):
+    if cpu.upper().startswith("FX3U") and i < len(stream):
+        token = bytes(stream[i:i + stream[i]])
+        if token in _FX_READ_OPERATORS:
+            name, arity = _FX_READ_OPERATORS[token]
+            return name, arity, i + len(token)
     operators = _fx_operators() if cpu.upper().startswith("FX3U") else _OPERATORS
     for seq, (name, arity) in operators.items():
         if stream[i : i + len(seq)] == seq:
@@ -488,6 +498,22 @@ def _read_operator(stream, i, cpu=""):
 
 
 def _read_operand(stream, i, cpu=""):
+    if cpu.upper().startswith("FX3U") and i < len(stream):
+        size = stream[i]
+        raw = stream[i:i + size]
+        if 4 <= size <= 7 and len(raw) == size and raw[-1] == size:
+            code, data = raw[1], raw[2:-1]
+            if code == 0xE9:
+                # 紧凑正数省略高零字节；负数保留完整 32 位补码。
+                return ('K' + str(int.from_bytes(data, 'little', signed=len(data) == 4)), i + size)
+            if size == 4 and code == 0xCC and data[0] <= 7:
+                return ('Z' + str(data[0]), i + size)
+            if size == 4 and code == 0xF0 and data[0] <= 7 and i + size + 1 < len(stream):
+                if stream[i + size + 1] == 0xA8:
+                    base = _read_operand(stream, i + size, cpu)
+                    if base:
+                        return (base[0] + 'Z' + str(data[0]), base[1])
+                return None
     if i + 4 <= len(stream) and stream[i] == 0x04 and stream[i + 3] == 0x04:
         named = _CONTACT_CODES.get(stream[i + 1])
         if named:

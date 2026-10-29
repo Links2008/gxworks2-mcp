@@ -9,6 +9,36 @@ def words(*values):
     return struct.pack("<" + "I" * len(values), *values)
 
 
+def is_sfc_source(raw: bytes) -> bool:
+    """只判断有界头部的源码类型，不把动作注册帧当作普通梯形图网络。"""
+    cursor = 0
+    for _ in range(2):
+        if cursor + 4 > len(raw):
+            return False
+        count = struct.unpack_from("<I", raw, cursor)[0]
+        cursor += 4
+        end = cursor + count * 2
+        if not 1 <= count <= 8192 or end > len(raw) or raw[end-2:end] != b"\0\0":
+            return False
+        cursor = end
+    cursor += 42
+    return cursor + 4 <= len(raw) and struct.unpack_from("<I", raw, cursor)[0] == 240
+
+
+def read_sfc_block(raw: bytes) -> dict:
+    """只读投影动作和条件；无法解析的目标保留诊断，不能用于重建批准。"""
+    source = parse_source(raw)
+    graph = parse_graph(source["graph"], strict=False)
+    if ({s["action"] for s in graph["steps"]} != set(source["actions"]) or
+            {e["transition"] for e in graph["edges"]} != set(source["transitions"])):
+        raise GxwError("图形引用与动作、条件注册不一致")
+    return dict(scanBlock=graph["scanBlock"], diagnostics=graph["diagnostics"],
+        topologyVerified=graph["topologyVerified"], steps=[
+            {**step, "il": decode_body(source["actions"][step["action"]]["body"])} for step in graph["steps"]],
+        transitions=[{**edge, "whenIl": decode_body(source["transitions"][edge["transition"]]["body"])}
+                     for edge in graph["edges"]])
+
+
 def decode_body(tokens: bytes) -> str:
     """动作片段借用已有指令解码器；补入 END 仅用于片段校验。"""
     body = tokens + bytes.fromhex("033403")
@@ -119,11 +149,13 @@ def parse_source(raw: bytes) -> dict:
                 transitions=transitions, tail=raw[cursor:])
 
 
-def parse_graph(tokens: bytes) -> dict:
+def parse_graph(tokens: bytes, *, strict: bool = True) -> dict:
     """按本机原生输出恢复步骤、动作号和显式跳转；未知图形指令直接拒绝。"""
     steps, edges, transition_numbers = {}, [], set()
     cursor, current, transition = 0, None, None
     scan = False
+    diagnostics = []
+    has_target = False
 
     def operand(code):
         nonlocal cursor
@@ -137,6 +169,7 @@ def parse_graph(tokens: bytes) -> dict:
         return int.from_bytes(raw[2:-1], "little")
 
     while cursor < len(tokens):
+        record_offset = cursor
         raw = tokens[cursor:cursor + 5]
         cursor += 5
         if raw in (bytes.fromhex("056c041c05"), bytes.fromhex("056c041405"), bytes.fromhex("056c021705")):
@@ -150,28 +183,38 @@ def parse_graph(tokens: bytes) -> dict:
             steps[current] = dict(number=current, action=action, state=None if single else "S" + str(action),
                                   initial=raw == bytes.fromhex("056c041c05"))
             scan |= single
-        elif raw in {bytes.fromhex("056c02" + key + "05") for key in ("04", "1d", "1e", "05")}:
-            if current is None or transition is not None:
+        elif raw in {bytes.fromhex("056c02" + key + "05") for key in
+                     (("04", "1d", "1e", "05") if strict else ("04", "1d", "1e", "05", "06"))}:
+            if current is None or (transition is not None and not has_target):
                 raise GxwError("SFC 转移所属步骤不明确")
             transition = operand(0x99)
+            has_target = False
             if transition in transition_numbers:
                 raise GxwError("SFC 转移引用重复")
             transition_numbers.add(transition)
+            if raw == bytes.fromhex("056c020605"):
+                diagnostics.append(dict(code="MULTI_TARGET_TRANSITION", transition=transition,
+                    record=raw.hex(), offset=record_offset, semanticsVerified=False))
         elif raw == bytes.fromhex("0562020005"):
             if current is None or transition is None:
                 raise GxwError("SFC 跳转缺少步骤或条件")
             edges.append(dict(source=current, transition=transition, target=operand(0x98)))
-            transition = None
+            has_target = True
+            if strict:
+                transition = None
         elif raw == bytes.fromhex("056c010a05"):
-            if current is None or transition is not None:
+            if current is None or (transition is not None and not has_target):
                 raise GxwError("SFC 步骤分组不完整")
-            current = None
+            current, transition = None, None
         else:
             raise GxwError("未知 SFC 图形指令：" + raw.hex())
-    if current is not None or transition is not None or not steps or any(e["target"] not in steps for e in edges):
+    missing = [e for e in edges if e["target"] not in steps]
+    if current is not None or transition is not None or not steps or (strict and missing):
         raise GxwError("SFC 图形引用不完整")
+    diagnostics.extend(dict(code="UNRESOLVED_TARGET", **edge) for edge in missing)
     if any(not any(e["source"] == number for e in edges) for number in steps):
         raise GxwError("SFC 步骤缺少转移")
     if scan and (len(steps) != 1 or len(edges) != 1):
         raise GxwError("未知连续扫描块布局")
-    return dict(steps=list(steps.values()), edges=edges, scanBlock=scan)
+    return dict(steps=list(steps.values()), edges=edges, scanBlock=scan,
+                diagnostics=diagnostics, topologyVerified=not diagnostics)

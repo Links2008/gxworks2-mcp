@@ -276,7 +276,7 @@ def _check_graph(layout, observed):
 
 def read_sfc_gxw(path: str) -> dict:
     """纯文件读取原生 SFC 图形引用、动作与转移，无原生进程。"""
-    from .sfc_binary import parse_source, parse_graph, decode_body
+    from .sfc_binary import read_sfc_block
     started = time.perf_counter()
     project = open_gxw(path)
     try:
@@ -286,17 +286,17 @@ def read_sfc_gxw(path: str) -> dict:
         for entry in project.programs():
             if not entry.name.endswith(".Program.pou"):
                 continue
-            source = parse_source(project.read_stream(entry))
-            graph = parse_graph(source["graph"])
-            if {s["action"] for s in graph["steps"]} != set(source["actions"]) or {e["transition"] for e in graph["edges"]} != set(source["transitions"]):
-                raise GxwError("图形引用与动作、条件注册不一致")
-            blocks.append(dict(name=entry.name, scanBlock=graph["scanBlock"], steps=[
-                {**step, "il": decode_body(source["actions"][step["action"]]["body"])} for step in graph["steps"]],
-                transitions=[{**edge, "whenIl": decode_body(source["transitions"][edge["transition"]]["body"])} for edge in graph["edges"]]))
+            try:
+                blocks.append(dict(name=entry.name, decoded=True, **read_sfc_block(project.read_stream(entry))))
+            except (GxwError, UnicodeError) as exc:
+                blocks.append(dict(name=entry.name, decoded=False, error=str(exc)))
         if not blocks:
             raise GxwError("未发现可完整读取的原生 SFC 程序块")
-        return dict(ok=True, path=project.path, cpu=project.cpu, representation="native-sfc-graph",
-                    blocks=blocks, sourceReadback=True, computerUseCalls=0, nativeProcessCount=0,
+        complete = all(b["decoded"] for b in blocks)
+        return dict(ok=complete, path=project.path, cpu=project.cpu, representation="native-sfc-graph",
+                    blocks=blocks, sourceReadback=complete, computerUseCalls=0, nativeProcessCount=0,
+                    topologyVerified=all(b.get("topologyVerified", False) for b in blocks),
+                    runnable=False, physicalPlcVerified=False,
                     readMs=round((time.perf_counter() - started) * 1000, 2))
     finally:
         project.close()
